@@ -80,6 +80,12 @@ export async function startMic(): Promise<void> {
 
   try {
     const ctx = new AudioContext();
+    // A fresh AudioContext can land in 'suspended' under the browser autoplay policy; resume it
+    // inside the mic-button gesture so the capture worklet's process() actually runs and PCM frames
+    // flow. This is the difference between "mic on, nothing streams" and a live pipeline (it didn't
+    // bite under a trusted automated click, but a real tab — backgrounded, refocused — can). No-op
+    // when already running.
+    if (ctx.state === 'suspended') await ctx.resume();
     const source = ctx.createMediaStreamSource(stream);
     audioCtx = ctx;
     mediaStream = stream;
