@@ -1,0 +1,16 @@
+[project]
+name = "triage-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.6",
+    "parakeet-mlx>=0.5.2",
+    "soundfile>=0.14.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

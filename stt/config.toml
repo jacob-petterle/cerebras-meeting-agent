@@ -1,0 +1,37 @@
+# triage-bot streamer configuration
+
+[audio]
+# Format the Zoom Linux SDK writes per-speaker raw PCM in (verified empirically)
+sample_rate = 32000      # Hz
+channels = 1             # mono
+sample_width = 2         # bytes (16-bit signed little-endian)
+
+[source]
+# Bind-mounted folder the Zoom bot writes into. Producer = container, consumer = this app.
+watch_dir = "/Users/dylanskinner/meetingsdk-headless-linux-sample/out"
+file_glob = "node-*.pcm" # per-speaker streams only (ignore mixed meeting-audio.pcm and wavs)
+start_from = "now"       # "now" = ignore audio already on disk at startup; "beginning" = transcribe all
+
+[stream]
+tick_seconds = 1.0       # how often the tailer polls for new bytes (poll, not inotify — VirtioFS)
+window_seconds = 8.0     # fixed STT window per speaker
+overlap_seconds = 1.0    # carry-over to avoid splitting words at the seam
+silence_rms_threshold = 250  # int16 RMS below this = treat chunk as silence, skip STT
+
+[stt]
+# v3 is the parakeet-mlx default and verified working on our 32kHz mono capture.
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+
+[sink]
+transcript_jsonl = "/Users/dylanskinner/triage-bot/transcripts/session.jsonl"
+echo_stdout = true
+
+[demo]
+# Used only by demo_orchestrator.py (the end-to-end echo loop). The STT
+# pipeline itself ignores this table.
+tts_host = "127.0.0.1"   # container's TCP mic port is published on localhost
+tts_port = 3001          # matches compose.yaml + --audio-send-port in the bot
+echo_prefix = "I heard you say: "
+# share_text_file defaults to <source.watch_dir>/share_text.txt (the bind-mounted
+# file the bot's screen share renders); uncomment to override.
+# share_text_file = "/Users/dylanskinner/meetingsdk-headless-linux-sample/out/share_text.txt"

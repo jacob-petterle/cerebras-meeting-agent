@@ -1,0 +1,10 @@
+services:
+  zoomsdk: &zoomsdk
+    build: ./
+    platform: linux/amd64
+    volumes:
+     - .:/tmp/meeting-sdk-linux-sample
+    ports:
+      - "3000:3000"
+      # TTS PCM ingestion (Mac TTS -> container virtual mic). 32kHz mono s16le.
+      - "3001:3001"

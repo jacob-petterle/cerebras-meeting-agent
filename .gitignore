@@ -5,3 +5,26 @@ dist/
 .DS_Store
 .deliverables/
 *.tsbuildinfo
+
+# ===== Zoom bot (bot/) — appended for Dylan's Zoom track =====
+# Zoom Meeting SDK binaries: licensed + ~537MB. NEVER commit. See bot/lib/zoomsdk/README.md
+bot/lib/zoomsdk/*
+!bot/lib/zoomsdk/README.md
+!bot/lib/zoomsdk/.gitkeep
+# Secrets: Zoom Client ID/Secret live here
+bot/config.toml
+# Regenerable / arch-specific build output
+bot/build/
+bot/vcpkg_installed/
+# Runtime artifacts (per-speaker audio, share text, recordings)
+bot/out/
+
+# ===== STT pipeline (stt/) =====
+stt/.venv/
+stt/transcripts/
+stt/**/__pycache__/
+
+# ===== audio artifacts anywhere =====
+*.pcm
+*.wav
+*.pcm.1
