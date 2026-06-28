@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>E2E — live loop, no mic</title>
+<style>
+  :root {
+    --bg:#0b0e14; --panel:#131822; --line:#232b3a; --ink:#e6edf6; --faint:#8d9bb0; --dim:#5d6b82;
+    --accent:#5cc8ff; --good:#46d39a; --good-bg:#0f2a22; --good-line:#1d6b50;
+    --amber:#ffce5a; --amber-bg:#241f0f; --purple:#b78cff; --bad:#ff6b7a;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  }
+  *{box-sizing:border-box} html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;font-size:16px;padding:max(16px,env(safe-area-inset-top)) 0 64px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 16px}
+  h1{font-size:22px;margin:6px 0 2px;letter-spacing:-.01em}
+  .sub{color:var(--faint);font-size:13px;margin-bottom:16px}
+  h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin:30px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+  code,.mono{font-family:var(--mono);font-size:.88em}
+  .verdict{background:linear-gradient(180deg,#10241c,#0e1a16);border:1px solid var(--good-line);border-left:3px solid var(--good);border-radius:12px;padding:16px 18px;margin:4px 0}
+  .verdict .big{font-size:18px;font-weight:700;color:#fff}
+  .verdict .big .chk{color:var(--good)}
+  .verdict p{margin:8px 0 0;font-size:14px;color:var(--ink)}
+  .grid{display:grid;gap:8px;margin:4px 0}
+  @media(min-width:640px){.grid.two{grid-template-columns:1fr 1fr}}
+  .stage{display:flex;gap:10px;align-items:flex-start;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .stage .ck{color:var(--good);font-weight:700;flex:none}
+  .stage .t{font-size:13.5px}
+  .stage .t b{color:#fff}
+  .stage .t span{color:var(--faint);display:block;font-size:12.5px;margin-top:1px}
+
+  table.tl{width:100%;border-collapse:collapse;font-size:13px;margin-top:4px}
+  table.tl td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  table.tl tr td:first-child{font-family:var(--mono);color:var(--dim);white-space:nowrap;width:48px}
+  .ev{font-weight:600}
+  .ev.in{color:var(--accent)} .ev.speak{color:var(--good)} .ev.call{color:var(--amber)} .ev.share{color:var(--purple)} .ev.sys{color:var(--faint)}
+  .meta{color:var(--faint)}
+
+  .chat{display:grid;gap:9px;margin-top:6px}
+  .bub{border-radius:12px;padding:9px 12px;max-width:88%;font-size:14px;border:1px solid var(--line)}
+  .bub .who{font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px;font-family:var(--mono)}
+  .bub.human{background:#0e1b2a;border-color:#1d3a52;justify-self:start}
+  .bub.human .who{color:var(--accent)}
+  .bub.agent{background:var(--good-bg);border-color:var(--good-line);justify-self:end}
+  .bub.agent .who{color:var(--good)}
+  .bub.tool{background:var(--amber-bg);border-color:#6b5a1d;justify-self:start;font-family:var(--mono);font-size:12.5px}
+  .bub.tool .who{color:var(--amber)}
+
+  .callout{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--purple);border-radius:10px;padding:13px 15px;margin:10px 0;font-size:14px}
+  .callout b{color:#fff}
+  .speed{display:flex;gap:6px;align-items:flex-end;margin:10px 0 0;flex-wrap:wrap}
+  .speed .bar{display:flex;flex-direction:column;align-items:center;gap:4px}
+  .speed .bar i{display:block;width:42px;background:linear-gradient(180deg,var(--accent),#2b6c8f);border-radius:4px 4px 0 0}
+  .speed .bar small{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .speed .bar b{font-family:var(--mono);font-size:12px;color:var(--ink)}
+
+  ul.notes{margin:8px 0 0;padding-left:18px}
+  ul.notes li{margin:6px 0;font-size:13.5px;color:var(--ink)}
+  ul.notes li b{color:#fff}
+  .amberdot{color:var(--amber)}
+  .foot{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);color:var(--faint);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>End-to-end loop — live, no microphone</h1>
+  <div class="sub">Real Silero VAD · Moonshine STT · kokoro TTS · <b>real Cerebras Gemma</b> · synthesized speech streamed over the WS · 2026-06-28</div>
+
+  <div class="verdict">
+    <div class="big"><span class="chk">✅</span> The full loop fired — both the speak path and the research→show path.</div>
+    <p>No mic: kokoro synthesized two utterances, streamed as <code>pcm</code> frames over the WebSocket exactly as the browser mic would. Everything below is what came back on the same WS surface the web app sees. <code>ok: true</code>.</p>
+  </div>
+
+  <h2>What got proven</h2>
+  <div class="grid two">
+    <div class="stage"><span class="ck">✓</span><div class="t"><b>pcm → VAD → utterance</b><span>Silero flushed 58k &amp; 121k-sample utterances from the streamed frames</span></div></div>
+    <div class="stage"><span class="ck">✓</span><div class="t"><b>STT → transcript</b><span>Moonshine transcribed both sentences verbatim (even "WebSocket")</span></div></div>
+    <div class="stage"><span class="ck">✓</span><div class="t"><b>heartbeat → Gemma decides</b><span>real Cerebras, ~1k prompt tokens = the resource blocks being read</span></div></div>
+    <div class="stage"><span class="ck">✓</span><div class="t"><b>speak → TTS → play</b><span>"Paris." synthesized and pushed back as a 1.4s play frame</span></div></div>
+    <div class="stage"><span class="ck">✓</span><div class="t"><b>call_agent → deliverable</b><span>sub-agent (mock) produced an html findings deliverable</span></div></div>
+    <div class="stage"><span class="ck">✓</span><div class="t"><b>deliverable → share_screen</b><span>next tick: Gemma saw it as a resource and put it on the stage</span></div></div>
+  </div>
+
+  <h2>Timeline</h2>
+  <table class="tl">
+    <tr><td>+3.4s</td><td><span class="ev in">STT▸transcript</span> <span class="meta">human: "…what is the capital of France?"</span></td></tr>
+    <tr><td>+5.8s</td><td><span class="ev sys">Gemma</span> <span class="meta">297.9 tok/s · 965 prompt · 14 completion</span></td></tr>
+    <tr><td>+6.3s</td><td><span class="ev speak">speak ▸ play</span> <span class="meta">"Paris." · TTS 1.4s</span></td></tr>
+    <tr><td>+11.8s</td><td><span class="ev in">STT▸transcript</span> <span class="meta">human: "investigate the double audio bug… put a summary on screen"</span></td></tr>
+    <tr><td>+15.7s</td><td><span class="ev call">call_agent ▸ deliverable</span> <span class="meta">891 tok/s · html "Sub-agent findings" (d73ba763)</span></td></tr>
+    <tr><td>+20.7s</td><td><span class="ev share">share_screen ▸ render</span> <span class="meta">1253 tok/s · html "Double Audio Playback Bug Findings"</span></td></tr>
+  </table>
+
+  <h2>The conversation (as it flowed)</h2>
+  <div class="chat">
+    <div class="bub human"><div class="who">me · human</div>Hey, quick question. What is the capital of France?</div>
+    <div class="bub agent"><div class="who">agent · speak</div>Paris.</div>
+    <div class="bub human"><div class="who">me · human</div>Can you investigate the double audio playback bug in the WebSocket client and put a short summary of the fix on the screen?</div>
+    <div class="bub tool"><div class="who">call_agent · tool</div>researched: …the double audio playback bug… (deliverable d73ba763)</div>
+    <div class="bub tool"><div class="who">share_screen · tool</div>shared a html: Double Audio Playback Bug Findings</div>
+  </div>
+
+  <div class="callout">
+    <b>This is the architecture change, validated.</b> After <code>call_agent</code> produced a deliverable,
+    the very next heartbeat's Gemma observed it inside the <code>&lt;deliverables&gt;</code> resource block and
+    chose to <code>share_screen</code> it — the "deliverables are a resource the agent observes" path I added,
+    working end-to-end. And the ~1,000 prompt tokens per call are the <code>&lt;transcript&gt;</code> +
+    <code>&lt;deliverables&gt;</code> blocks — the conversation entered as a resource, never as an addressed turn.
+  </div>
+
+  <h2>Inference speed (live, measured)</h2>
+  <div class="speed">
+    <div class="bar"><b>298</b><i style="height:24px"></i><small>call 1</small></div>
+    <div class="bar"><b>603</b><i style="height:48px"></i><small>call 2</small></div>
+    <div class="bar"><b>891</b><i style="height:71px"></i><small>call 3</small></div>
+    <div class="bar"><b>1253</b><i style="height:100px"></i><small>call 4</small></div>
+  </div>
+  <div class="sub" style="margin-top:8px">tok/s, warming toward Cerebras's ~1,500 ceiling for this model. Measured from <code>usage</code> + wall-clock, the same number the web HUD shows.</div>
+
+  <h2>Honest caveats</h2>
+  <ul class="notes">
+    <li><b class="amberdot">⚠</b> <b>Native teardown abort.</b> After the summary was written, the harness force-kills the model processes and <code>onnxruntime-node</code> throws a <code>mutex lock failed</code> abort (exit 134). It is <b>post-result and cosmetic</b> — the loop already passed. Worth a graceful-shutdown handler on the real server before relying on Ctrl-C mid-inference.</li>
+    <li><b class="amberdot">●</b> <b>STT ran on synthesized speech</b> (clean kokoro audio). Moonshine nailed it; a real noisy mic will be harder — but the transcript→brain→tools half is identical regardless of how the words arrive.</li>
+    <li><b class="amberdot">●</b> <b><code>call_agent</code> is still the mock</b> (fixed FINDINGS.html, &lt;1s). The real Cursor SDK swap (task #8) keeps the same return contract, so this loop won't change shape — only the latency and the findings content will.</li>
+  </ul>
+
+  <div class="foot">
+    Artifacts: <code>docs/e2e-run.log</code> (full client+server trace) · <code>docs/e2e-summary.json</code> (machine-readable) ·
+    <code>docs/e2e-server.log</code> (server [pipe] stages). Re-run: <code>node_modules/.bin/tsx packages/server/scripts/e2e-live.mts</code>.
+    <br><b>Note:</b> your server still running on :8787 predates these changes — restart <code>pnpm dev</code> to pick up the resource refactor + audio fix.
+  </div>
+</div>
+</body>
+</html>

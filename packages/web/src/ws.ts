@@ -115,6 +115,21 @@ function scheduleReconnect(): void {
 }
 
 export function connect(): void {
+  /**
+   * Idempotent: never hold two live sockets at once. A second connect() while one is already
+   * CONNECTING or OPEN would leave BOTH receiving the server's broadcasts — and since every client
+   * plays the TTS `play` frame, the same utterance would be scheduled twice and play back-to-back
+   * (the double-audio bug). The only legitimate re-entry is after a socket has closed (reconnect
+   * nulls `socket` in onclose), so guard on a still-live socket here. This also absorbs an HMR
+   * re-eval or an accidental double call without ever spawning a duplicate connection.
+   */
+  if (
+    socket &&
+    (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)
+  ) {
+    return;
+  }
+
   stopped = false;
   useHarnessStore.getState().setConnection('connecting');
 
@@ -161,4 +176,16 @@ export function disconnect(): void {
     socket = null;
   }
   useHarnessStore.getState().setConnection('closed');
+}
+
+/**
+ * HMR teardown. When Vite hot-replaces this module, the OLD module's WebSocket would otherwise stay
+ * open with its `onmessage` still bound to the old module's `playPcm` — a second live socket that
+ * double-schedules every TTS frame. Disposing the old socket on hot-replace (and a full reload
+ * re-boots a single fresh connection) keeps the invariant "exactly one live socket" across reloads.
+ */
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    disconnect();
+  });
 }
