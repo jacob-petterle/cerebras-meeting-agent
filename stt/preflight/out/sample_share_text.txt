@@ -1,1 +1,0 @@
-I heard you say: please escalate the database outage to the on-call engineer right away
