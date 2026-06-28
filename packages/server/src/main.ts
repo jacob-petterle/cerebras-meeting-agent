@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide } from './core/decide';
@@ -27,11 +28,16 @@ const SESSION_CONTEXT =
   'A local test session. One human participant ("me") is speaking into a microphone. No specific project is in scope yet — be a generally helpful collaborator.';
 
 async function main(): Promise<void> {
-  // Load .env if present (Node >= 20.12 / 22). Absent file is fine.
-  try {
-    process.loadEnvFile?.('.env');
-  } catch {
-    /* no .env — rely on the ambient environment */
+  // Load env (Node >= 20.12 / 22). `pnpm dev` runs with cwd=packages/server (pnpm --filter), so the
+  // repo-root .env is NOT at cwd — try cwd first, then the repo-root .env resolved relative to this
+  // module (../../../ from packages/server/src/main.ts). First file that loads wins; absent is fine.
+  for (const candidate of ['.env', fileURLToPath(new URL('../../../.env', import.meta.url))]) {
+    try {
+      process.loadEnvFile?.(candidate);
+      break;
+    } catch {
+      /* not at this path — try the next candidate (ambient env still applies) */
+    }
   }
 
   const apiKey = process.env.CEREBRAS_API_KEY ?? '';
