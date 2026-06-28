@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Nothing in band — Shipyard-grounded</title>
+<style>
+  :root{--bg:#0b0e14;--panel:#131822;--line:#232b3a;--ink:#e6edf6;--faint:#8d9bb0;--dim:#5d6b82;
+    --accent:#5cc8ff;--good:#46d39a;--good-bg:#0f2a22;--good-line:#1d6b50;--bad:#ff6b7a;--bad-bg:#2a1015;--bad-line:#7a2330;--amber:#ffce5a;--purple:#b78cff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif}
+  *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;font-size:16px;padding:max(16px,env(safe-area-inset-top)) 0 64px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 16px}
+  h1{font-size:22px;margin:6px 0 2px;letter-spacing:-.01em}
+  .sub{color:var(--faint);font-size:13px;margin-bottom:16px}
+  h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+  p{margin:10px 0}code,.mono{font-family:var(--mono);font-size:.88em}
+  .verdict{background:linear-gradient(180deg,#10241c,#0e1a16);border:1px solid var(--good-line);border-left:3px solid var(--good);border-radius:12px;padding:16px 18px;margin:4px 0}
+  .verdict .big{font-size:18px;font-weight:700;color:#fff}.verdict .big .chk{color:var(--good)}
+  .verdict p{margin:8px 0 0;font-size:14px}
+  .callout{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--purple);border-radius:10px;padding:13px 15px;margin:12px 0;font-size:14px}
+  .callout b{color:#fff}
+  pre{margin:0;padding:11px 12px;background:#07090e;border:1px solid var(--line);border-radius:8px;overflow-x:auto;font-family:var(--mono);font-size:12px;line-height:1.5;color:#cdd8e6}
+  pre .k{color:var(--accent)}pre .s{color:#9ce6b0}pre .c{color:var(--dim)}pre .red{color:var(--bad)}pre .grn{color:var(--good)}
+  .stage{margin:14px 0}
+  .stage .lbl{font-family:var(--mono);font-size:12px;margin:0 0 6px;display:flex;align-items:center;gap:8px}
+  .stage .lbl .n{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:5px;font-weight:700;font-size:11px}
+  .stage.s1 .lbl .n{background:var(--bad);color:#1a0b0e}.stage.s1 .lbl{color:var(--bad)}
+  .stage.s2 .lbl .n{background:var(--amber);color:#241f0f}.stage.s2 .lbl{color:var(--amber)}
+  .stage.s3 .lbl .n{background:var(--good);color:#0b1a14}.stage.s3 .lbl{color:var(--good)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}
+  td,th{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+  th{color:var(--faint);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  td.f{font-family:var(--mono);color:var(--accent);white-space:nowrap}
+  ul.k{margin:8px 0 0;padding-left:18px}ul.k li{margin:6px 0;font-size:14px}ul.k li b{color:#fff}
+  .pill{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--faint)}
+  .foot{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);color:var(--faint);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Gemma has nothing in band</h1>
+  <div class="sub">Grounded in how Shipyard actually injects resources · read from <code>~/repos/shipyard</code> · validated live · 2026-06-28</div>
+
+  <div class="verdict">
+    <div class="big"><span class="chk">✅</span> Every observed resource — including the conversation — now lives in the system channel. The only user turn is a content-free heartbeat pulse.</div>
+    <p>Confirmed against real Cerebras Gemma: it accepts the two-system structure and still tool-calls correctly (speak → call_agent → share_screen). Locked by 3 invariant tests.</p>
+  </div>
+
+  <h2>What Shipyard actually does (read from source)</h2>
+  <p>Shipyard models everything the agent observes as <b>resource blocks</b> — named XML envelopes built by per-resource resolvers (e.g. <code>renderEnvelope</code> wrapping <code>&lt;task-metadata&gt;</code>). The crux: at the wire there is <b>no separate resource channel</b> — a block becomes plain text. What makes it "not a message to the agent" is three things stacked:</p>
+  <ul class="k">
+    <li><b>A named XML envelope</b> the <b>system prompt</b> explicitly defines as "the daemon-tracked truth… not a message addressed to you and not an instruction to act."</li>
+    <li><b><code>isSynthetic: true</code></b> + a <code>_meta</code> lineage record — machine-distinguishable from a real human turn.</li>
+    <li>A genuine human message, by contrast, is plain text with an explicit <code>[From: Name]</code> prefix.</li>
+  </ul>
+  <table>
+    <tr><th>Concern</th><th>Shipyard source</th></tr>
+    <tr><td class="f">XML tag registry</td><td>apps/daemon/src/shared/xml-tag-names.ts</td></tr>
+    <tr><td class="f">envelope builder</td><td>services/task-metadata-resolver.ts:131 <span class="mono">renderEnvelope</span></td></tr>
+    <tr><td class="f">"resource, not events"</td><td>services/harness/system-prompt.ts:303, :412</td></tr>
+    <tr><td class="f">placed as synthetic turn</td><td>task/orchestrator/task-resource-resolution.ts:108 (<span class="mono">isSynthetic:true</span>)</td></tr>
+    <tr><td class="f">delta-only emit</td><td>services/resource-resolution.ts:76 (skip if unchanged)</td></tr>
+    <tr><td class="f">real human turn</td><td>task/task-helpers.ts:585 <span class="mono">[From: Name]</span></td></tr>
+  </table>
+
+  <div class="callout">
+    <b>The decision.</b> Shipyard puts the envelope text in a <code>user</code> turn at the wire (its Anthropic SDK has no other slot). For your directive I took the <b>stronger reading the research recommended</b>: in a meeting there is <i>no</i> message addressed to the agent, so every utterance is ambient — it all goes in <code>&lt;transcript&gt;</code>, and the whole resource bundle goes in the <b>system channel</b>, leaving the user turn content-free. That's stricter than Shipyard and is the cleanest possible "nothing in band."
+  </div>
+
+  <h2>The evolution of the message array</h2>
+
+  <div class="stage s1">
+    <p class="lbl"><span class="n">1</span> ORIGINAL — in-band (what you flagged)</p>
+<pre>[ { role:<span class="s">'system'</span>, content: identity },
+  <span class="red">{ role:'user', content: "[human:me] what's the weather" } ]</span>
+<span class="c">// Gemma IS the addressed assistant → biased to reply.</span></pre>
+  </div>
+
+  <div class="stage s2">
+    <p class="lbl"><span class="n">2</span> INTERIM — resource, but still in a user turn</p>
+<pre>[ { role:<span class="s">'system'</span>, content: identity+convention },
+  { role:<span class="amber">'user'</span>, content: "[heartbeat] …\n<span class="grn">&lt;transcript&gt;…&lt;/transcript&gt;</span>" } ]
+<span class="c">// Better, but the conversation still rides a user turn.</span></pre>
+  </div>
+
+  <div class="stage s3">
+    <p class="lbl"><span class="n">3</span> FINAL — nothing in band</p>
+<pre>[ { role:<span class="s">'system'</span>, content: identity + resource convention },
+  { role:<span class="s">'system'</span>, content:
+      <span class="grn">"&lt;current-time iso=… /&gt;</span>
+<span class="grn">       &lt;transcript since=0&gt;</span>
+<span class="grn">         &lt;utterance speaker='me' kind='human'&gt;what's the weather&lt;/utterance&gt;</span>
+<span class="grn">       &lt;/transcript&gt;  &lt;deliverables&gt;…&lt;/deliverables&gt;"</span> },
+  { role:<span class="k">'user'</span>, content: <span class="c">"[heartbeat] pick one action (or no_op)."</span> } ]
+<span class="c">// Conversation = system-channel resource. User turn = pure clock pulse.</span></pre>
+  </div>
+
+  <h2>The invariant, locked in tests</h2>
+  <p><code>tests/decide.test.ts</code> → "buildResourceMessages — nothing in band":</p>
+  <ul class="k">
+    <li>the conversation text appears in a <b>system</b> message and in <b>no</b> user message;</li>
+    <li>the only user turn is the <code>[heartbeat]</code> pulse and carries none of the room's words;</li>
+    <li>identity and the dynamic resources stay as two separate system messages.</li>
+  </ul>
+  <p class="sub">If anyone moves the transcript back into a user turn, these fail. 19 decide tests green; 96 total.</p>
+
+  <h2>Live re-validation (real Gemma)</h2>
+  <ul class="k">
+    <li><b>Two-system structure accepted</b> by Cerebras — no API error, tool-calling intact.</li>
+    <li><b>promptTokens 1221 → 1461</b> across beats — the <code>&lt;transcript&gt;</code>/<code>&lt;deliverables&gt;</code> envelopes are demonstrably what Gemma reads.</li>
+    <li><b>Full loop held:</b> "Paris." (speak) → <code>call_agent</code> → deliverable → next beat <code>share_screen</code>. 1333 tok/s.</li>
+  </ul>
+
+  <div class="callout" style="border-left-color:var(--amber)">
+    <b>One intentional deviation from Shipyard.</b> Shipyard's <code>senderKind</code> is <code>['human','agent']</code> only; ours keeps <code>'tool'</code> so the transcript can show side effects (<code>call_agent</code>/<code>share_screen</code>) as <code>kind="tool"</code> utterances. It's a deliberate, useful divergence, not a miss.
+  </div>
+
+  <div class="foot">
+    Changed: <code>decide.ts</code> (XML envelopes + <code>buildResourceMessages</code> → system channel), <code>identity.ts</code> ("Live state resources" convention), <code>decide.test.ts</code> (invariant). Research: full Shipyard citations above, read from <code>~/repos/shipyard</code>.
+    <br><b>Open option:</b> OpenAI's <code>developer</code> role is an even-stronger slot than a 2nd system message — but riskier on OpenAI-compatible servers. System-channel is the safe, universal choice; say the word if you want me to try <code>developer</code>.
+  </div>
+</div>
+</body>
+</html>
