@@ -1,0 +1,24 @@
+{
+  "name": "@meeting-agent/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@meeting-agent/protocol": "workspace:*",
+    "@cursor/sdk": "^1.0.22",
+    "@huggingface/transformers": "^3.8.0",
+    "@ricky0123/vad-node": "^0.0.3",
+    "kokoro-js": "^1.2.1",
+    "onnxruntime-node": "1.21.0",
+    "openai": "^6.45.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12"
+  }
+}
