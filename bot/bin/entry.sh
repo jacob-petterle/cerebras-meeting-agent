@@ -9,11 +9,17 @@ mkdir -p out
 # Stage-page screen share knobs (overridable via compose `environment:`):
 #   SHARE_MODE   stage (default) -> launch Chromium on Xvfb and capture it
 #                text            -> skip Chromium; the bot renders out/share_text.txt
-#   STAGE_URL    page the headed Chromium loads (the Mac-served web stage)
+#   DEBUG_UI     1 -> the bot loads the FULL operator console (?view=full) so you can debug what the
+#                agent is doing live INSIDE the Zoom screen-share; default 0 -> deliverable-only stage.
+#   STAGE_URL    explicit FULL override of the page Chromium loads (host + view). When unset it is
+#                built from DEBUG_UI against the Mac's Vite dev server.
 #   DISPLAY      the Xvfb display Chromium draws on / the bot captures (:99)
 SHARE_MODE="${SHARE_MODE:-stage}"
-STAGE_URL="${STAGE_URL:-http://host.docker.internal:5173/?view=stage}"
+DEBUG_UI="${DEBUG_UI:-0}"
+case "$DEBUG_UI" in 1 | true | yes | on) STAGE_VIEW="full" ;; *) STAGE_VIEW="stage" ;; esac
+STAGE_URL="${STAGE_URL:-http://host.docker.internal:5173/?view=${STAGE_VIEW}}"
 export DISPLAY="${DISPLAY:-:99}"
+echo "[entry] DEBUG_UI=$DEBUG_UI -> loading stage page: $STAGE_URL"
 
 CHROME_BIN="${CHROME_BIN:-google-chrome-stable}"
 
