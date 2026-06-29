@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "pnpm --filter @meeting-agent/server dev",
     "web": "pnpm --filter @meeting-agent/web dev",
+    "web:debug": "pnpm --filter @meeting-agent/web dev:debug",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
