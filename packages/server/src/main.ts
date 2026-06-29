@@ -51,6 +51,18 @@ function summarizeDecision(d: Decision): string {
   }
 }
 
+/**
+ * Last-resort process guards. A live demo backend must NOT die because one async path threw — a
+ * single bad STT chunk or a transient brain hiccup should log, not exit(1) mid-session. These catch
+ * what the per-path handlers miss, keep the process alive, and surface the cause in the log.
+ */
+process.on('unhandledRejection', (reason) => {
+  console.error('[main] unhandledRejection (kept alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[main] uncaughtException (kept alive):', err);
+});
+
 async function main(): Promise<void> {
   // Load env (Node >= 20.12 / 22). `pnpm dev` runs with cwd=packages/server (pnpm --filter), so the
   // repo-root .env is NOT at cwd — try cwd first, then the repo-root .env resolved relative to this
@@ -104,17 +116,22 @@ async function main(): Promise<void> {
     }
     vad.pushFrame(frame);
   });
-  vad.onUtterance(async (u) => {
-    console.log(`[pipe] VAD→utterance ${u.pcm.length}smp @${u.sampleRate}Hz`);
-    const text = (await stt.transcribe(u.pcm, u.sampleRate)).trim();
-    console.log(`[pipe] STT→ "${text}"`);
-    if (!text) return;
-    resources.transcript.append({
-      participantId: u.participantId,
-      senderKind: 'human',
-      text,
-      timestamp: u.ts,
-    });
+  vad.onUtterance((u) => {
+    // The VAD invokes this un-awaited (fire-and-forget per participant), so a throw here would become
+    // an UNHANDLED REJECTION that takes the whole process down (exit 1) mid-session — the crash that
+    // killed a live mic test. Own the rejection: log and drop this one utterance, never propagate.
+    void (async () => {
+      console.log(`[pipe] VAD→utterance ${u.pcm.length}smp @${u.sampleRate}Hz`);
+      const text = (await stt.transcribe(u.pcm, u.sampleRate)).trim();
+      console.log(`[pipe] STT→ "${text}"`);
+      if (!text) return;
+      resources.transcript.append({
+        participantId: u.participantId,
+        senderKind: 'human',
+        text,
+        timestamp: u.ts,
+      });
+    })().catch((err) => console.error('[pipe] utterance handler failed (dropped):', err));
   });
 
   const boundPort = await ws.whenReady;
