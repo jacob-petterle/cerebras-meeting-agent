@@ -4,6 +4,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from 'openai/resources/chat/completions';
+import type { ReasoningEffort } from 'openai/resources/shared';
 
 /**
  * Cerebras (Gemma-4) brain client + the streamed-tool_call accumulator.
@@ -152,6 +153,14 @@ export interface CerebrasOptions {
   apiKey: string;
   baseURL?: string;
   model?: string;
+  /**
+   * Native reasoning-effort, threaded onto the OpenAI-compat `reasoning_effort` param when set. Gemma
+   * is not a native reasoning model, so Cerebras may reject or ignore this for `gemma-4-31b`; left
+   * unset by default so tool-calling is never disturbed. We rely on a PROMPT-level "think briefly
+   * first" instruction (decide.ts) for the actual think-before-you-act behavior. Opt in via env if a
+   * future model/endpoint supports it.
+   */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** Real Cerebras-backed client. Tests never construct this — they drive `assembleStream` directly. */
@@ -166,6 +175,7 @@ export function createCerebrasClient(opts: CerebrasOptions): CerebrasClient {
         messages,
         stream: true,
         stream_options: { include_usage: true },
+        ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
         ...(tools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
       };
       const stream = await client.chat.completions.create(params);

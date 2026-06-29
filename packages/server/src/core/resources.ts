@@ -1,4 +1,9 @@
-import type { DeliverableRecord, LogEntry, TranscriptEntry } from '@meeting-agent/protocol';
+import type {
+  DeliverableRecord,
+  LogEntry,
+  SubAgentTaskRecord,
+  TranscriptEntry,
+} from '@meeting-agent/protocol';
 
 /**
  * Own seqNo append-log — mirrors Shipyard's jsonl-conversation-store (seqNo == array index),
@@ -70,12 +75,19 @@ export function createAppendLog<T>(): AppendLog<T> {
 export interface Resources {
   transcript: AppendLog<TranscriptEntry>;
   deliverables: AppendLog<DeliverableRecord>;
+  /**
+   * Live sub-agent tasks — the Shipyard sub-task pattern. The slow Cursor research agent appends its
+   * status here (running → progress → done/error) so the heartbeat can OBSERVE it each beat instead of
+   * blocking on the dispatch. Append-only, keyed by `id`; readers fold latest-per-id (last wins).
+   */
+  subAgents: AppendLog<SubAgentTaskRecord>;
 }
 
-/** The shared resource spine: one transcript log + one deliverables log. */
+/** The shared resource spine: transcript + deliverables + sub-agent-task logs. */
 export function createResources(): Resources {
   return {
     transcript: createAppendLog<TranscriptEntry>(),
     deliverables: createAppendLog<DeliverableRecord>(),
+    subAgents: createAppendLog<SubAgentTaskRecord>(),
   };
 }

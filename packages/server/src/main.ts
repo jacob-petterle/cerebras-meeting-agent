@@ -2,7 +2,8 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
-import { createDecide, type Decision } from './core/decide';
+import { createDecide, foldLatestById, type Decision } from './core/decide';
+import { createCorrector, type RawUtterance } from './core/correct';
 import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
 import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
@@ -20,8 +21,8 @@ import type { AudioInPort, AudioOutPort, DisplayPort, Ports } from './core/ports
 
 /**
  * Entrypoint — wires the transport-agnostic core to an adapter set:
- *   browser mic (WS pcm) → VAD → STT → transcript
- *   5s heartbeat → Gemma decides → tools (speak/share_screen/call_agent/no_op)
+ *   browser mic (WS pcm) → VAD → STT → raw buffer (corrected on the heartbeat) → transcript
+ *   4s heartbeat → correct buffered STT → Gemma decides → tools (speak/share_screen/call_agent/no_op)
  *   speak → TTS → browser speakers ·  share_screen → browser stage
  *
  * Two adapter sets, selected by `ZOOM`:
@@ -59,6 +60,15 @@ function argField(args: unknown, key: string): string {
   if (!isRecord(args)) return '';
   const value = args[key];
   return typeof value === 'string' ? value : '';
+}
+
+/**
+ * Normalize a task string for the re-fire comparison: trim, lowercase, collapse internal whitespace.
+ * Two tasks that differ only in casing/spacing are treated as the SAME research so a model that
+ * rephrases (or ignores the prompt) can't spawn a duplicate Cursor run for work already in flight.
+ */
+function normalizeTask(task: string): string {
+  return task.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 /** A short, human-readable description of a decision for the console feed (incl. no_op's reason). */
@@ -103,6 +113,8 @@ async function main(): Promise<void> {
   }
 
   const apiKey = process.env.CEREBRAS_API_KEY ?? '';
+  /** With a brain (key present) STT is buffered + corrected on the heartbeat; without one it streams raw. */
+  const brainEnabled = apiKey.length > 0;
   /** Cursor account key for the real sub-agent. Absent → the mock call_agent (no-key path) is used. */
   const cursorKey = process.env.CURSOR_API_KEY ?? '';
 
@@ -126,9 +138,20 @@ async function main(): Promise<void> {
   let stopTransport: (() => void) | null = null;
   /** Set once the brain is enabled; the reset handler rewinds its cursor when a client clears the session. */
   let orchestratorRef: Orchestrator | null = null;
+  /**
+   * Raw STT segments awaiting correction. With the brain enabled the VAD/STT path appends HERE (not
+   * straight to the transcript); the heartbeat's correct-step drains it, corrects the batch, and
+   * appends the CORRECTED lines. `sessionEpoch` lets an in-flight correction notice a reset that
+   * raced it and drop its now-stale batch.
+   */
+  const rawBuffer: RawUtterance[] = [];
+  let sessionEpoch = 0;
   const onReset = (): void => {
+    sessionEpoch += 1;
+    rawBuffer.length = 0;
     resources.transcript.reset();
     resources.deliverables.reset();
+    resources.subAgents.reset();
     orchestratorRef?.reset();
   };
 
@@ -159,9 +182,9 @@ async function main(): Promise<void> {
 
   const ports: Ports = { audioIn, audioOut, display };
 
-  // AudioIn → VAD → STT → transcript. The per-utterance VAD/STT lines are kept as terminal-side
-  // observability (the meeting agent's pipeline is meant to be watchable); the high-frequency
-  // per-frame pcm log is gated behind DEBUG_PIPE so the default output stays readable.
+  // AudioIn → VAD → STT → (raw buffer, corrected on the heartbeat) → transcript. The per-utterance
+  // VAD/STT lines are kept as terminal-side observability (the meeting agent's pipeline is meant to be
+  // watchable); the high-frequency per-frame pcm log is gated behind DEBUG_PIPE so output stays readable.
   let pcmFrames = 0;
   audioIn.onPcm((frame) => {
     if (DEBUG_PIPE && pcmFrames++ % 40 === 0) {
@@ -178,12 +201,25 @@ async function main(): Promise<void> {
       const text = (await stt.transcribe(u.pcm, u.sampleRate)).trim();
       console.log(`[pipe] STT→ "${text}"`);
       if (!text) return;
-      resources.transcript.append({
-        participantId: u.participantId,
-        senderKind: 'human',
-        text,
-        timestamp: u.ts,
-      });
+      if (brainEnabled) {
+        /**
+         * Buffer the RAW segment. The heartbeat's correct-step (a Gemma pass) cleans the batch and
+         * appends the corrected line — so raw STT never reaches the transcript while the brain is on,
+         * and the brain only ever observes corrected text.
+         */
+        rawBuffer.push({ participantId: u.participantId, text, timestamp: u.ts });
+      } else {
+        /**
+         * No brain (no key) → no corrector. Stream the raw line straight to the transcript so the web
+         * app still shows a live transcript even with the agent disabled.
+         */
+        resources.transcript.append({
+          participantId: u.participantId,
+          senderKind: 'human',
+          text,
+          timestamp: u.ts,
+        });
+      }
     })().catch((err) => console.error('[pipe] utterance handler failed (dropped):', err));
   });
 
@@ -193,21 +229,62 @@ async function main(): Promise<void> {
   /** Heartbeat stopper, set when the brain is enabled; invoked by the graceful-shutdown handler. */
   let stopHeartbeat: (() => void) | null = null;
 
-  // Brain + tools + 5s heartbeat — only when a key is present, so the server still binds (and
+  // Brain + tools + 4s heartbeat — only when a key is present, so the server still binds (and
   // audio/transcript still stream to the web app) without one. The OpenAI client throws on an
   // empty key, so we must not construct it unconditionally.
   if (apiKey) {
-    const cerebras = createCerebrasClient({ apiKey });
+    /**
+     * Native reasoning-effort is OFF by default. Gemma (`gemma-4-31b`) is not a reasoning model, so
+     * Cerebras is expected to reject/ignore `reasoning_effort` for it; the actual think-before-you-act
+     * behavior comes from a PROMPT instruction (identity.ts / heartbeat pulse). `CEREBRAS_REASONING`
+     * lets the owner opt in IF a future model/endpoint supports it — empty ⇒ unset (tool-calling
+     * untouched). Only the documented effort levels are honored; anything else is treated as off.
+     */
+    const reasoningEnv = process.env.CEREBRAS_REASONING ?? '';
+    const reasoningEffort =
+      reasoningEnv === 'minimal' || reasoningEnv === 'low' || reasoningEnv === 'medium' || reasoningEnv === 'high'
+        ? reasoningEnv
+        : undefined;
+    const cerebras = createCerebrasClient({ apiKey, reasoningEffort });
     const decide = createDecide({
       cerebras,
       context: SESSION_CONTEXT,
       /** The deliverables resource — observed as a `<deliverables>` block each tick (not in-band). */
       deliverables: resources.deliverables,
+      /** The sub-agent-task resource — observed as a `<sub_agents>` block each tick (live research status). */
+      subAgents: resources.subAgents,
       /** The transcript resource — the model observes the FULL conversation each beat (new marked). */
       transcript: resources.transcript,
       /** Live tok/s + token counts → the web HUD (otherwise computed in cerebras.ts and discarded). */
       onStats: (stats) => ws.broadcastStats(stats),
     });
+    /**
+     * Transcript corrector — step ONE of each heartbeat. Drains the raw STT buffer, corrects the
+     * batch against the prior (already-corrected) conversation as context, and appends the cleaned
+     * lines to the transcript BEFORE `decide` reads it. A separate Gemma call, walled off from the
+     * brain: its own static system prompt + frozen-history prefix keep Cerebras's prompt cache warm.
+     */
+    const corrector = createCorrector({ cerebras, transcript: resources.transcript });
+    const correct = async (): Promise<void> => {
+      if (rawBuffer.length === 0) return;
+      const epoch = sessionEpoch;
+      /** Drain everything buffered so far; segments that arrive mid-correction wait for the next beat. */
+      const batch = rawBuffer.splice(0, rawBuffer.length);
+      const corrected = await corrector.correct(batch);
+      /** A reset() raced this correction (session cleared mid-call) → drop the now-stale batch. */
+      if (epoch !== sessionEpoch) return;
+      for (let i = 0; i < batch.length; i++) {
+        const seg = batch[i];
+        if (!seg) continue;
+        resources.transcript.append({
+          participantId: seg.participantId,
+          senderKind: 'human',
+          text: corrected[i] ?? seg.text,
+          timestamp: seg.timestamp,
+        });
+      }
+      console.log(`[correct] ${batch.length} raw segment(s) → corrected → transcript`);
+    };
     /**
      * call_agent backend: the REAL Cursor SDK when a CURSOR_API_KEY is present (it investigates the
      * working tree and writes a real findings doc), otherwise the mock (the no-key path, keeps the
@@ -217,6 +294,8 @@ async function main(): Promise<void> {
     const callAgent: CallAgentFn = cursorKey
       ? createCallAgentCursor({
           deliverables: resources.deliverables,
+          /** Live status (running → progress → done/error) so the heartbeat observes the run, never blocks on it. */
+          subAgents: resources.subAgents,
           outDir: '.deliverables',
           apiKey: cursorKey,
           cwd: CURSOR_AGENT_CWD,
@@ -248,6 +327,25 @@ async function main(): Promise<void> {
        * the model's strong no_op bias holds for agent-authored lines).
        */
       dispatch: async (decision) => {
+        /**
+         * Re-fire hard guard (belt-and-suspenders). The <sub_agents> resource already tells the model
+         * not to re-dispatch a running task, but a model that ignores the prompt could still emit a
+         * duplicate call_agent. Before dispatching one, fold the subAgents log latest-by-id; if an OPEN
+         * (status=running) task's normalized name matches the requested task, SKIP the dispatch — log
+         * it, append nothing — so we never spawn a second Cursor run for work already in flight.
+         */
+        if (decision.name === 'call_agent') {
+          const requested = normalizeTask(argField(decision.args, 'task'));
+          const alreadyRunning =
+            requested.length > 0 &&
+            foldLatestById(resources.subAgents.snapshot().map((e) => e.data)).some(
+              (t) => t.status === 'running' && normalizeTask(t.task) === requested,
+            );
+          if (alreadyRunning) {
+            console.log(`[main] call_agent skipped — already running: ${requested}`);
+            return;
+          }
+        }
         const outcome = await registry.dispatch(decision);
         if (!outcome) return;
         resources.transcript.append({

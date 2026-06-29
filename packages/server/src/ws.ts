@@ -9,6 +9,7 @@ import type {
 } from '@meeting-agent/protocol';
 import type { Resources } from './core/resources';
 import type { AppendLog } from './core/resources';
+import { assertNever } from './lib/assert-never';
 
 /**
  * WebSocket host for the resource protocol (subscribe / catch_up / append / fetch_older / older)
@@ -22,13 +23,13 @@ import type { AppendLog } from './core/resources';
 
 const SubscribeMsg = z.object({
   type: z.literal('subscribe'),
-  resource: z.enum(['transcript', 'deliverables']),
+  resource: z.enum(['transcript', 'deliverables', 'subAgents']),
   sinceSeqNo: z.number(),
 });
 
 const FetchOlderMsg = z.object({
   type: z.literal('fetch_older'),
-  resource: z.enum(['transcript', 'deliverables']),
+  resource: z.enum(['transcript', 'deliverables', 'subAgents']),
   beforeSeqNo: z.number(),
   limit: z.number(),
 });
@@ -73,7 +74,16 @@ export interface WsServerHandle {
 }
 
 function resourceLog(resources: Resources, name: ResourceName): AppendLog<unknown> {
-  return name === 'transcript' ? resources.transcript : resources.deliverables;
+  switch (name) {
+    case 'transcript':
+      return resources.transcript;
+    case 'deliverables':
+      return resources.deliverables;
+    case 'subAgents':
+      return resources.subAgents;
+    default:
+      return assertNever(name);
+  }
 }
 
 function send(ws: WebSocket, msg: ServerMsg): void {

@@ -3,8 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DeliverableRecord } from '@meeting-agent/protocol';
-import type { DeliverableRecord as DeliverableRecordT } from '@meeting-agent/protocol';
+import type {
+  DeliverableRecord as DeliverableRecordT,
+  SubAgentTaskRecord as SubAgentTaskRecordT,
+} from '@meeting-agent/protocol';
 import { createAppendLog } from '../packages/server/src/core/resources';
+import { foldLatestById } from '../packages/server/src/core/decide';
 import {
   createCallAgentCursor,
   type CursorAgent,
@@ -210,6 +214,133 @@ describe('call_agent (real Cursor SDK, injected fake agent)', () => {
       expect(errSpy).toHaveBeenCalled();
     } finally {
       errSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Sub-agent status emission (#16/#18) — driven with the SAME injected fake agent (NO live Cursor run,
+ * no credits). When a `subAgents` log is injected, the call must emit status as APPENDS keyed by the
+ * run id: a `running` record before the run, fresh `running` records as progress streams, then a
+ * terminal `done` (success) or `error` (timeout/failure). The deliverable id and the terminal
+ * `deliverableId` must match (same minted id). This is what lets the heartbeat observe the run live.
+ */
+describe('call_agent sub-agent status emission (running → done / error)', () => {
+  const latest = (log: ReturnType<typeof createAppendLog<SubAgentTaskRecordT>>): SubAgentTaskRecordT[] =>
+    foldLatestById(log.snapshot().map((e) => e.data));
+
+  it('emits running (with progress) then done, with deliverableId matching the record id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
+    try {
+      const deliverables = createAppendLog<DeliverableRecordT>();
+      const subAgents = createAppendLog<SubAgentTaskRecordT>();
+      const run = fakeRun({
+        events: [{ type: 'assistant', message: { content: [{ type: 'text', text: 'reading files' }] } }],
+        result: { status: 'finished', result: 'all clear' },
+      });
+      const callAgent = createCallAgentCursor({
+        deliverables,
+        subAgents,
+        outDir: dir,
+        apiKey: 'crsr_test',
+        cwd: dir,
+        onProgress: () => {},
+        agentFactory: fakeFactory(run, { closed: () => {}, prompt: () => {} }),
+      });
+
+      const rec = await callAgent({ task: 'check the build' });
+
+      // The FIRST append is a running record (announced before agent.send).
+      const all = subAgents.snapshot().map((e) => e.data);
+      expect(all[0]!.status).toBe('running');
+      // Progress streamed into the record (the streamed line is on the tail).
+      expect(all.some((s) => s.progress.some((p) => p.includes('reading files')))).toBe(true);
+      // The folded (latest) state is `done`, linked to the produced deliverable by id.
+      const [current] = latest(subAgents);
+      expect(current!.status).toBe('done');
+      expect(current!.deliverableId).toBe(rec.id);
+      expect(current!.endedAt).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('emits a terminal error status on timeout (the run hangs)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
+    try {
+      const deliverables = createAppendLog<DeliverableRecordT>();
+      const subAgents = createAppendLog<SubAgentTaskRecordT>();
+      const run = fakeRun({ hang: true, supportsCancel: true });
+      const callAgent = createCallAgentCursor({
+        deliverables,
+        subAgents,
+        outDir: dir,
+        apiKey: 'crsr_test',
+        cwd: dir,
+        timeoutMs: 20,
+        onProgress: () => {},
+        agentFactory: fakeFactory(run, { closed: () => {}, prompt: () => {} }),
+      });
+
+      await callAgent({ task: 'a hang' });
+
+      const [current] = latest(subAgents);
+      expect(current!.status).toBe('error');
+      expect(current!.error).toContain('Timed out');
+      expect(current!.endedAt).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('emits a terminal error status when the agent factory throws', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const deliverables = createAppendLog<DeliverableRecordT>();
+      const subAgents = createAppendLog<SubAgentTaskRecordT>();
+      const callAgent = createCallAgentCursor({
+        deliverables,
+        subAgents,
+        outDir: dir,
+        apiKey: 'crsr_test',
+        cwd: dir,
+        onProgress: () => {},
+        agentFactory: async () => {
+          throw new Error('auth failed');
+        },
+      });
+
+      await callAgent({ task: 'anything' });
+
+      const [current] = latest(subAgents);
+      expect(current!.status).toBe('error');
+      expect(current!.error).toContain('auth failed');
+    } finally {
+      errSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('works without a subAgents log (existing unit-test path): no status, deliverable unchanged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
+    try {
+      const deliverables = createAppendLog<DeliverableRecordT>();
+      const run = fakeRun({ result: { status: 'finished', result: 'done' } });
+      const callAgent = createCallAgentCursor({
+        deliverables,
+        outDir: dir,
+        apiKey: 'crsr_test',
+        cwd: dir,
+        onProgress: () => {},
+        agentFactory: fakeFactory(run, { closed: () => {}, prompt: () => {} }),
+      });
+
+      const rec = await callAgent({ task: 'no status please' });
+      expect(rec.kind).toBe('html');
+      expect(deliverables.snapshot()).toHaveLength(1);
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -73,6 +73,7 @@ function subscribeAll(): void {
   const { hwm } = useHarnessStore.getState();
   send({ type: 'subscribe', resource: 'transcript', sinceSeqNo: hwm.transcript });
   send({ type: 'subscribe', resource: 'deliverables', sinceSeqNo: hwm.deliverables });
+  send({ type: 'subscribe', resource: 'subAgents', sinceSeqNo: hwm.subAgents });
 }
 
 function dispatch(message: Incoming): void {
@@ -80,14 +81,17 @@ function dispatch(message: Incoming): void {
   switch (message.type) {
     case 'catch_up':
       if (message.resource === 'transcript') store.applyTranscriptCatchUp(message.entries);
+      else if (message.resource === 'subAgents') store.applySubAgentCatchUp(message.entries);
       else store.applyDeliverableCatchUp(message.entries);
       break;
     case 'append':
       if (message.resource === 'transcript') store.applyTranscriptAppend(message.entry);
+      else if (message.resource === 'subAgents') store.applySubAgentAppend(message.entry);
       else store.applyDeliverableAppend(message.entry);
       break;
     case 'older':
       if (message.resource === 'transcript') store.applyTranscriptOlder(message.entries);
+      else if (message.resource === 'subAgents') store.applySubAgentOlder(message.entries);
       else store.applyDeliverableOlder(message.entries);
       break;
     case 'render':

@@ -2,6 +2,7 @@ import type {
   DeliverableRecord,
   LogEntry,
   RenderCommand,
+  SubAgentTaskRecord,
   TranscriptEntry,
 } from '@meeting-agent/protocol';
 import { create } from 'zustand';
@@ -74,7 +75,13 @@ export function mergeOlder<T>(entries: LogEntry<T>[], incoming: LogEntry<T>[]): 
 interface HarnessState {
   transcript: LogEntry<TranscriptEntry>[];
   deliverables: LogEntry<DeliverableRecord>[];
-  hwm: { transcript: number; deliverables: number };
+  /**
+   * Live sub-agent tasks — the append-log of status records (running → progress → done/error), keyed
+   * by id. Stored raw (every append); the Agents view folds latest-per-id on read, the same way the
+   * server and the brain do. This is what makes research visible in the console while it runs.
+   */
+  subAgents: LogEntry<SubAgentTaskRecord>[];
+  hwm: { transcript: number; deliverables: number; subAgents: number };
 
   connection: ConnState;
   connectedSince: number | null;
@@ -99,6 +106,10 @@ interface HarnessState {
   applyDeliverableCatchUp: (entries: LogEntry<DeliverableRecord>[]) => void;
   applyDeliverableOlder: (entries: LogEntry<DeliverableRecord>[]) => void;
 
+  applySubAgentAppend: (entry: LogEntry<SubAgentTaskRecord>) => void;
+  applySubAgentCatchUp: (entries: LogEntry<SubAgentTaskRecord>[]) => void;
+  applySubAgentOlder: (entries: LogEntry<SubAgentTaskRecord>[]) => void;
+
   setRender: (cmd: RenderCommand) => void;
   notePlay: () => void;
   setStats: (stats: ServerStats) => void;
@@ -113,7 +124,8 @@ interface HarnessState {
 export const useHarnessStore = create<HarnessState>()((set) => ({
   transcript: [],
   deliverables: [],
-  hwm: { transcript: -1, deliverables: -1 },
+  subAgents: [],
+  hwm: { transcript: -1, deliverables: -1, subAgents: -1 },
 
   connection: 'connecting',
   connectedSince: null,
@@ -175,6 +187,26 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
       return next === prev.deliverables ? prev : { deliverables: next };
     }),
 
+  applySubAgentAppend: (entry) =>
+    set((prev) => {
+      const merged = mergeAppend(prev.subAgents, prev.hwm.subAgents, entry);
+      if (merged.entries === prev.subAgents && merged.hwm === prev.hwm.subAgents) return prev;
+      return { subAgents: merged.entries, hwm: { ...prev.hwm, subAgents: merged.hwm } };
+    }),
+
+  applySubAgentCatchUp: (entries) =>
+    set((prev) => {
+      const merged = mergeCatchUp(prev.subAgents, prev.hwm.subAgents, entries);
+      if (merged.entries === prev.subAgents && merged.hwm === prev.hwm.subAgents) return prev;
+      return { subAgents: merged.entries, hwm: { ...prev.hwm, subAgents: merged.hwm } };
+    }),
+
+  applySubAgentOlder: (entries) =>
+    set((prev) => {
+      const next = mergeOlder(prev.subAgents, entries);
+      return next === prev.subAgents ? prev : { subAgents: next };
+    }),
+
   setRender: (cmd) => set((prev) => ({ render: cmd, renderCount: prev.renderCount + 1 })),
 
   notePlay: () => set((prev) => ({ playCount: prev.playCount + 1, lastPlayAt: Date.now() })),
@@ -187,7 +219,8 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
     set({
       transcript: [],
       deliverables: [],
-      hwm: { transcript: -1, deliverables: -1 },
+      subAgents: [],
+      hwm: { transcript: -1, deliverables: -1, subAgents: -1 },
       render: null,
       decisions: [],
     }),

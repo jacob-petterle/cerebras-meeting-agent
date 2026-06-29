@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { DeliverableRecord } from '@meeting-agent/protocol';
-import type { LogEntry, TranscriptEntry } from '@meeting-agent/protocol';
+import { DeliverableRecord, SubAgentTaskRecord } from '@meeting-agent/protocol';
+import type { LogEntry, SubAgentTaskRecord as SubAgentTaskRecordT, TranscriptEntry } from '@meeting-agent/protocol';
 import { createOrchestrator } from '../packages/server/src/core/orchestrator';
 import type { Scheduler } from '../packages/server/src/core/orchestrator';
-import type { Decision } from '../packages/server/src/core/decide';
+import { foldLatestById, type Decision } from '../packages/server/src/core/decide';
 import { createAppendLog } from '../packages/server/src/core/resources';
 import { createRegistry } from '../packages/server/src/core/tools/registry';
 import type { Ports } from '../packages/server/src/core/ports';
@@ -100,29 +100,31 @@ describe('orchestrator heartbeat', () => {
     expect(decide).toHaveBeenCalledTimes(1);
   });
 
-  it('holds a busy lock: a slow call_agent in-flight blocks the next tick from firing a second action', async () => {
+  it('holds a busy lock: a slow FAST action in-flight blocks the next tick from firing a second action', async () => {
+    // The busy-lock double-fire guard applies to FAST actions (speak/share_screen). call_agent is now
+    // fire-and-forget (a separate test below), so this uses `speak` to keep the original intent intact.
     const transcript = createAppendLog<TranscriptEntry>();
-    transcript.append(entry('please research X')); // seqNo 0
+    transcript.append(entry('say something')); // seqNo 0
 
     const decide = vi.fn(async (_delta: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
-      name: 'call_agent',
-      args: { task: 'research X' },
+      name: 'speak',
+      args: { text: 'on it' },
     }));
 
-    // A slow dispatch we control: the call_agent action stays in-flight until released.
+    // A slow dispatch we control: the speak action stays in-flight until released.
     let release!: () => void;
     const gate = new Promise<void>((res) => {
       release = res;
     });
     const dispatch = vi.fn(async (d: Decision) => {
-      if (d.name === 'call_agent') await gate;
+      if (d.name === 'speak') await gate;
     });
 
     const { scheduler, tick } = fakeScheduler();
     const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
     orch.start();
 
-    // Tick 1: starts call_agent; dispatch is pending on the gate.
+    // Tick 1: starts speak; dispatch is pending on the gate.
     await tick();
     expect(decide).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledTimes(1);
@@ -144,6 +146,46 @@ describe('orchestrator heartbeat', () => {
     await tick();
     expect(decide).toHaveBeenCalledTimes(2);
     expect(decide.mock.calls[1]![0].map((e) => e.data.text)).toEqual(['and also Y']);
+  });
+
+  it('a call_agent decision is FIRE-AND-FORGET: it does NOT block the next tick (the brain keeps ticking)', async () => {
+    // The non-blocking fix (#16). A slow research sub-agent must not hold the busy lock for its whole
+    // run. The orchestrator advances the cursor + releases busy the instant it dispatches call_agent,
+    // so the very next tick decides again WHILE the sub-agent is still "in flight".
+    const transcript = createAppendLog<TranscriptEntry>();
+    transcript.append(entry('please research X')); // seqNo 0
+
+    let calls = 0;
+    const decide = vi.fn(async (_delta: LogEntry<TranscriptEntry>[]): Promise<Decision> => {
+      calls += 1;
+      // First beat dispatches research; afterwards the brain stays silent.
+      return calls === 1
+        ? { name: 'call_agent', args: { task: 'research X' } }
+        : { name: 'no_op', args: {} };
+    });
+
+    // The research run never resolves within the test — it stays "in flight" the whole time.
+    const dispatch = vi.fn((d: Decision) => (d.name === 'call_agent' ? new Promise<void>(() => {}) : Promise.resolve()));
+
+    const { scheduler, tick } = fakeScheduler();
+    const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
+    orch.start();
+
+    // Tick 1: dispatches call_agent (detached, never resolves). Cursor advances + busy released NOW.
+    await tick();
+    await flush();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(orch.getCursor().transcript).toBe(0);
+
+    // New content arrives while the sub-agent is still running.
+    transcript.append(entry('meanwhile, another point')); // seqNo 1
+
+    // Tick 2: the brain DECIDES AGAIN even though the sub-agent run is still in flight — not blocked.
+    await tick();
+    await flush();
+    expect(decide).toHaveBeenCalledTimes(2);
+    expect(decide.mock.calls[1]![0].map((e) => e.data.text)).toEqual(['meanwhile, another point']);
+    expect(orch.getCursor().transcript).toBe(1);
   });
 
   it('a decide() that rejects releases the busy lock and the next tick runs again (no wedge)', async () => {
@@ -346,25 +388,28 @@ describe('orchestrator: decision feed + reset', () => {
   });
 
   it('reset() rewinds the cursor to -1 and a guarded in-flight dispatch cannot clobber it', async () => {
+    // Uses a FAST action (speak) parked on a gate: the cursor only advances when the dispatch resolves,
+    // so the reset's generation-guard has a window to invalidate the deferred cursor write. (call_agent
+    // is fire-and-forget and advances the cursor synchronously, so it can't exercise this race.)
     const transcript = createAppendLog<TranscriptEntry>();
-    transcript.append(entry('research X')); // seqNo 0 → claimedHead 0
+    transcript.append(entry('say X')); // seqNo 0 → claimedHead 0
 
     let release!: () => void;
     const gate = new Promise<void>((res) => {
       release = res;
     });
     const decide = vi.fn(async (_d: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
-      name: 'call_agent',
-      args: { task: 'X' },
+      name: 'speak',
+      args: { text: 'X' },
     }));
     const dispatch = vi.fn(async (d: Decision) => {
-      if (d.name === 'call_agent') await gate;
+      if (d.name === 'speak') await gate;
     });
     const { scheduler, tick } = fakeScheduler();
     const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
     orch.start();
 
-    // Tick 1: starts call_agent; it parks on the gate, so the cursor has NOT advanced yet.
+    // Tick 1: starts speak; it parks on the gate, so the cursor has NOT advanced yet.
     await tick();
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(orch.getCursor().transcript).toBe(-1);
@@ -378,5 +423,82 @@ describe('orchestrator: decision feed + reset', () => {
     release();
     await flush();
     expect(orch.getCursor().transcript).toBe(-1);
+  });
+});
+
+/**
+ * The re-fire hard guard (#16, belt-and-suspenders) main.ts installs in its dispatch wrapper: before
+ * dispatching a call_agent, fold the subAgents log latest-by-id and SKIP if an open running task's
+ * normalized name matches. This stops a model that ignores the <sub_agents> prompt from spawning a
+ * duplicate Cursor run. We reproduce the exact wrapper logic here (mirroring the write-back-wrapper
+ * test above), driving real dispatches through it.
+ */
+describe('re-fire hard guard (no duplicate call_agent for a task already running)', () => {
+  /** Same normalization as main.ts: trim, lowercase, collapse internal whitespace. */
+  const normalizeTask = (task: string): string => task.trim().toLowerCase().replace(/\s+/g, ' ');
+
+  const argTask = (args: unknown): string =>
+    typeof args === 'object' && args !== null && 'task' in args && typeof args.task === 'string'
+      ? args.task
+      : '';
+
+  const sub = (over: Partial<SubAgentTaskRecordT>): SubAgentTaskRecordT =>
+    SubAgentTaskRecord.parse({ id: 'a1', status: 'running', task: 'research X', startedAt: 1, ...over });
+
+  it('skips a call_agent whose task is already listed as running (normalized match)', async () => {
+    const subAgents = createAppendLog<SubAgentTaskRecordT>();
+    // A run for "research X" is already in flight (status=running).
+    subAgents.append(sub({ id: 'a1', status: 'running', task: 'research X' }));
+
+    const callAgent = vi.fn(async () =>
+      DeliverableRecord.parse({ id: 'd', kind: 'html', title: 't', producedAt: 1, registeredAt: 2 }),
+    );
+
+    // The exact guarded dispatch wrapper main.ts wires.
+    const dispatch = async (decision: Decision): Promise<void> => {
+      if (decision.name === 'call_agent') {
+        const requested = normalizeTask(argTask(decision.args));
+        const alreadyRunning =
+          requested.length > 0 &&
+          foldLatestById(subAgents.snapshot().map((e) => e.data)).some(
+            (t) => t.status === 'running' && normalizeTask(t.task) === requested,
+          );
+        if (alreadyRunning) return; // SKIP — already in flight.
+      }
+      await callAgent();
+    };
+
+    // A model that re-requests the SAME task, only differing in casing/spacing, must be skipped.
+    await dispatch({ name: 'call_agent', args: { task: '  Research   X ' } });
+    expect(callAgent).not.toHaveBeenCalled();
+  });
+
+  it('still dispatches a NEW task, and re-dispatches once the prior run has finished', async () => {
+    const subAgents = createAppendLog<SubAgentTaskRecordT>();
+    subAgents.append(sub({ id: 'a1', status: 'running', task: 'research X' }));
+
+    const dispatched: string[] = [];
+    const dispatch = async (decision: Decision): Promise<void> => {
+      if (decision.name === 'call_agent') {
+        const requested = normalizeTask(argTask(decision.args));
+        const alreadyRunning =
+          requested.length > 0 &&
+          foldLatestById(subAgents.snapshot().map((e) => e.data)).some(
+            (t) => t.status === 'running' && normalizeTask(t.task) === requested,
+          );
+        if (alreadyRunning) return;
+        dispatched.push(requested);
+      }
+    };
+
+    // A different task is NOT blocked.
+    await dispatch({ name: 'call_agent', args: { task: 'research Y' } });
+    expect(dispatched).toEqual(['research y']);
+
+    // The prior run completes (a terminal `done` append for the same id) → folded status is no longer
+    // running, so re-dispatching "research X" is now allowed.
+    subAgents.append(sub({ id: 'a1', status: 'done', task: 'research X', deliverableId: 'd1', endedAt: 9 }));
+    await dispatch({ name: 'call_agent', args: { task: 'research X' } });
+    expect(dispatched).toEqual(['research y', 'research x']);
   });
 });

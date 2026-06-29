@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Agent } from '@cursor/sdk';
-import { type CallAgentArgs, DeliverableRecord } from '@meeting-agent/protocol';
+import { type CallAgentArgs, DeliverableRecord, SubAgentTaskRecord } from '@meeting-agent/protocol';
 import { isRecord } from '../../../lib/is-record';
 import type { AppendLog } from '../../resources';
 import type { CallAgentFn } from './mock';
@@ -35,6 +35,12 @@ const DEFAULT_MODEL = 'composer-2';
 const DEFAULT_TIMEOUT_MS = 180_000;
 /** How much of the agent's final summary text we keep for the deliverable `description` field. */
 const DESCRIPTION_MAX = 200;
+/**
+ * Bound on the streamed-progress tail we carry on each sub-agent status record. The Cursor agent can
+ * emit hundreds of lines; the brain only needs the most recent few to know what it's doing right now,
+ * and an unbounded array would balloon every status snapshot the heartbeat renders each beat.
+ */
+const PROGRESS_TAIL = 12;
 
 /**
  * The slice of `@cursor/sdk`'s `Run` we drive. Declaring a narrow structural interface (rather than
@@ -75,6 +81,13 @@ export type CursorAgentFactory = (opts: CursorAgentFactoryOptions) => Promise<Cu
 
 export interface CallAgentCursorDeps {
   deliverables: AppendLog<DeliverableRecord>;
+  /**
+   * The sub-agent-task resource. We append status here (running → progress → done/error) so the
+   * heartbeat can OBSERVE the run live instead of blocking on it. Optional so the existing unit test
+   * (no live status surface) still constructs this without it; when omitted, status is not emitted but
+   * every DeliverableRecord behavior is unchanged.
+   */
+  subAgents?: AppendLog<SubAgentTaskRecord>;
   /** Directory the findings HTML is written into (caller owns its lifecycle). */
   outDir: string;
   /** Cursor account API key (`crsr_...`). Passed explicitly so we don't rely on ambient env here. */
@@ -276,16 +289,98 @@ async function waitWithTimeout(
   }
 }
 
+/**
+ * A small status emitter over the optional `subAgents` log. Each call APPENDS a fresh record keyed by
+ * the run `id` (append-only — the log never mutates prior entries; readers fold latest-per-id). It
+ * keeps the live progress tail so a `running` update carries the most-recent {@link PROGRESS_TAIL}
+ * streamed lines. A no-op when `subAgents` is absent (the unit-test path). Never throws — a status
+ * write must never break the never-throw sub-agent contract.
+ */
+function createStatusEmitter(
+  log: AppendLog<SubAgentTaskRecord> | undefined,
+  args: { id: string; task: string; startedAt: number },
+) {
+  let progress: string[] = [];
+  const emit = (record: Partial<SubAgentTaskRecord>): void => {
+    if (!log) return;
+    try {
+      log.append(
+        SubAgentTaskRecord.parse({
+          id: args.id,
+          task: args.task,
+          startedAt: args.startedAt,
+          status: 'running',
+          progress,
+          ...record,
+        }),
+      );
+    } catch (err) {
+      console.error('[cursor] sub-agent status append failed (ignored):', err);
+    }
+  };
+  return {
+    running(): void {
+      emit({ status: 'running' });
+    },
+    /** Push one streamed line onto the bounded tail and emit a fresh running record. */
+    note(line: string): void {
+      progress = [...progress, line].slice(-PROGRESS_TAIL);
+      emit({ status: 'running', progress });
+    },
+    done(deliverableId: string): void {
+      emit({ status: 'done', deliverableId, endedAt: Date.now() });
+    },
+    error(message: string): void {
+      emit({ status: 'error', error: message, endedAt: Date.now() });
+    },
+  };
+}
+
 export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
   const model = deps.model ?? DEFAULT_MODEL;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const onProgress = deps.onProgress ?? ((line: string) => console.log(line));
+  const baseOnProgress = deps.onProgress ?? ((line: string) => console.log(line));
   const agentFactory = deps.agentFactory ?? defaultAgentFactory;
 
   return async (args: CallAgentArgs): Promise<DeliverableRecord> => {
     const id = randomUUID();
+    const startedAt = Date.now();
     mkdirSync(deps.outDir, { recursive: true });
     const findingsPath = join(deps.outDir, `FINDINGS-${id}.html`);
+
+    /**
+     * Status emitter over the subAgents resource. We mint the run `id` here and reuse the SAME id for
+     * the deliverable, so the terminal `done` record's `deliverableId` matches the produced artifact.
+     */
+    const status = createStatusEmitter(deps.subAgents, { id, task: args.task, startedAt });
+    /**
+     * Wrap onProgress so every streamed line both reaches the terminal (live visibility, unchanged)
+     * AND lands in the sub-agent's progress tail — that tail is what the heartbeat renders and the web
+     * shows, so the brain can see what the sub-agent is doing without blocking on it (Task #18).
+     */
+    const onProgress = (line: string): void => {
+      baseOnProgress(line);
+      status.note(line);
+    };
+    /** Announce the run BEFORE agent.send so the very first heartbeat after dispatch sees it running. */
+    status.running();
+
+    /**
+     * Register the deliverable AND fold the matching terminal status onto the subAgents log in one
+     * step, so every return path keeps the resource consistent with what was produced. `done` for a
+     * successful run, `error` for the timeout/failure paths (the deliverable is still renderable — the
+     * never-throw contract — but the brain should see the run did not complete cleanly).
+     */
+    const finishDone = (description: string): DeliverableRecord => {
+      const record = registerDeliverable(deps, { id, filePath: findingsPath, description });
+      status.done(record.id);
+      return record;
+    };
+    const finishError = (description: string, message: string): DeliverableRecord => {
+      const record = registerDeliverable(deps, { id, filePath: findingsPath, description });
+      status.error(message);
+      return record;
+    };
 
     /**
      * One agent, created per call and closed in `finally` (the dag-runner's per-task pattern). The
@@ -321,23 +416,21 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
         onProgress(`[cursor] sub-agent timed out after ${timeoutMs}ms — cancelled`);
         const written = readFindingsIfWritten(findingsPath);
         if (written !== null) {
-          /** It managed to write the file before the timeout — use it. */
-          return registerDeliverable(deps, {
-            id,
-            filePath: findingsPath,
-            description: `Timed out, but findings were written for task: ${args.task}`,
-          });
+          /** It managed to write the file before the timeout — use it (still flagged as error). */
+          return finishError(
+            `Timed out, but findings were written for task: ${args.task}`,
+            `Timed out after ${timeoutMs}ms`,
+          );
         }
         writeFileSync(
           findingsPath,
           fallbackHtml(args.task, '', `The sub-agent timed out after ${timeoutMs}ms before completing.`),
           'utf-8',
         );
-        return registerDeliverable(deps, {
-          id,
-          filePath: findingsPath,
-          description: `Sub-agent timed out for task: ${args.task}`,
-        });
+        return finishError(
+          `Sub-agent timed out for task: ${args.task}`,
+          `Timed out after ${timeoutMs}ms`,
+        );
       }
 
       const result = waited.result;
@@ -346,11 +439,9 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
       const written = readFindingsIfWritten(findingsPath);
       if (written !== null) {
         /** The agent wrote our exact path — register that file directly. */
-        return registerDeliverable(deps, {
-          id,
-          filePath: findingsPath,
-          description: summarize(result.result, DESCRIPTION_MAX) || `Findings for task: ${args.task}`,
-        });
+        return finishDone(
+          summarize(result.result, DESCRIPTION_MAX) || `Findings for task: ${args.task}`,
+        );
       }
 
       /**
@@ -362,11 +453,9 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
           ? 'The sub-agent did not write a findings file; this page was built from its summary.'
           : `The sub-agent ended with status "${result.status}"; this page was built from its summary.`;
       writeFileSync(findingsPath, fallbackHtml(args.task, result.result ?? '', note), 'utf-8');
-      return registerDeliverable(deps, {
-        id,
-        filePath: findingsPath,
-        description: summarize(result.result, DESCRIPTION_MAX) || `Findings for task: ${args.task}`,
-      });
+      return finishDone(
+        summarize(result.result, DESCRIPTION_MAX) || `Findings for task: ${args.task}`,
+      );
     } catch (err) {
       /**
        * Last-resort fallback: the dispatch must not crash on a sub-agent failure. Log the cause and
@@ -384,11 +473,7 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
       } catch {
         /** Even the fallback write failed (e.g. unwritable outDir) — still return a parseable record. */
       }
-      return registerDeliverable(deps, {
-        id,
-        filePath: findingsPath,
-        description: `Sub-agent failed for task: ${args.task}`,
-      });
+      return finishError(`Sub-agent failed for task: ${args.task}`, message);
     } finally {
       /** Always release the agent's resources, success or failure (the dag-runner's `finally` close). */
       try {

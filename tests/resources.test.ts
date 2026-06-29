@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { DeliverableRecord } from '@meeting-agent/protocol';
-import type { DeliverableRecord as DeliverableRecordT } from '@meeting-agent/protocol';
+import { DeliverableRecord, SubAgentTaskRecord } from '@meeting-agent/protocol';
+import type {
+  DeliverableRecord as DeliverableRecordT,
+  SubAgentTaskRecord as SubAgentTaskRecordT,
+} from '@meeting-agent/protocol';
 import { createAppendLog, createResources } from '../packages/server/src/core/resources';
 
 describe('AppendLog', () => {
@@ -107,6 +110,57 @@ describe('deliverables resource', () => {
     expect(snapshot.map((e) => e.data.id)).toEqual(['d1', 'd2']);
     expect(snapshot.map((e) => e.seqNo)).toEqual([0, 1]);
 
+    unsub();
+  });
+});
+
+describe('SubAgentTaskRecord', () => {
+  it('parses a minimal record and fills the nullable/array defaults', () => {
+    const rec = SubAgentTaskRecord.parse({
+      id: 'a1',
+      status: 'running',
+      task: 'investigate the cache',
+      startedAt: 100,
+    });
+    expect(rec.endedAt).toBeNull();
+    expect(rec.progress).toEqual([]);
+    expect(rec.deliverableId).toBeNull();
+    expect(rec.error).toBeNull();
+  });
+
+  it('round-trips a full record through parse() unchanged', () => {
+    const full: SubAgentTaskRecordT = {
+      id: 'a1',
+      status: 'done',
+      task: 'investigate the cache',
+      startedAt: 100,
+      endedAt: 200,
+      progress: ['read cache.ts', 'found stale TTL'],
+      deliverableId: 'd1',
+      error: null,
+    };
+    expect(SubAgentTaskRecord.parse(full)).toEqual(full);
+  });
+
+  it('rejects an unknown status', () => {
+    expect(
+      SubAgentTaskRecord.safeParse({ id: 'a1', status: 'paused', task: 't', startedAt: 1 }).success,
+    ).toBe(false);
+  });
+
+  it('the subAgents resource log appends + snapshots status records (append-only, keyed by id)', () => {
+    const { subAgents } = createResources();
+    const seen: SubAgentTaskRecordT[] = [];
+    const unsub = subAgents.subscribe((e) => seen.push(e.data));
+
+    subAgents.append(SubAgentTaskRecord.parse({ id: 'a1', status: 'running', task: 'dig', startedAt: 1 }));
+    subAgents.append(
+      SubAgentTaskRecord.parse({ id: 'a1', status: 'done', task: 'dig', startedAt: 1, deliverableId: 'd1' }),
+    );
+
+    // Append-only: BOTH records are retained (the read-side fold collapses them to latest-per-id).
+    expect(subAgents.snapshot().map((e) => e.data.status)).toEqual(['running', 'done']);
+    expect(seen.map((s) => s.status)).toEqual(['running', 'done']);
     unsub();
   });
 });

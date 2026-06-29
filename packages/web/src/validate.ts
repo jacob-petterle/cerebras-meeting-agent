@@ -4,6 +4,7 @@ import {
   type RenderCommand,
   type RenderKind,
   type ResourceName,
+  SubAgentTaskRecord,
   TranscriptEntry,
 } from '@meeting-agent/protocol';
 import { z } from 'zod';
@@ -48,8 +49,10 @@ const logEntry = <S extends z.ZodTypeAny>(data: S) =>
 
 const zTranscriptEntry = logEntry(TranscriptEntry);
 const zDeliverableEntry = logEntry(DeliverableRecord);
+const zSubAgentEntry = logEntry(SubAgentTaskRecord);
 const zTranscriptEntries = z.array(zTranscriptEntry);
 const zDeliverableEntries = z.array(zDeliverableEntry);
+const zSubAgentEntries = z.array(zSubAgentEntry);
 const zPlay = z.object({ sampleRate: z.number().positive(), pcm: z.array(z.number()) });
 /** Flat `stats` frame shape emitted by the server -- see ServerStats above. */
 const zStats = z.object({
@@ -64,13 +67,21 @@ const zDecision = z.object({ name: z.string(), detail: z.string(), ts: z.number(
 export type Incoming =
   | { type: 'catch_up'; resource: 'transcript'; entries: LogEntry<TranscriptEntry>[] }
   | { type: 'catch_up'; resource: 'deliverables'; entries: LogEntry<DeliverableRecord>[] }
+  | { type: 'catch_up'; resource: 'subAgents'; entries: LogEntry<SubAgentTaskRecord>[] }
   | { type: 'append'; resource: 'transcript'; entry: LogEntry<TranscriptEntry> }
   | { type: 'append'; resource: 'deliverables'; entry: LogEntry<DeliverableRecord> }
+  | { type: 'append'; resource: 'subAgents'; entry: LogEntry<SubAgentTaskRecord> }
   | { type: 'older'; resource: 'transcript'; entries: LogEntry<TranscriptEntry>[]; hasMore: boolean }
   | {
       type: 'older';
       resource: 'deliverables';
       entries: LogEntry<DeliverableRecord>[];
+      hasMore: boolean;
+    }
+  | {
+      type: 'older';
+      resource: 'subAgents';
+      entries: LogEntry<SubAgentTaskRecord>[];
       hasMore: boolean;
     }
   | { type: 'render'; cmd: RenderCommand }
@@ -80,7 +91,7 @@ export type Incoming =
   | { type: 'reset' };
 
 function parseResource(value: unknown): ResourceName | null {
-  return value === 'transcript' || value === 'deliverables' ? value : null;
+  return value === 'transcript' || value === 'deliverables' || value === 'subAgents' ? value : null;
 }
 
 function parseBatch(
@@ -98,6 +109,13 @@ function parseBatch(
       ? { type: 'older', resource, entries: r.data, hasMore }
       : { type: 'catch_up', resource, entries: r.data };
   }
+  if (resource === 'subAgents') {
+    const r = zSubAgentEntries.safeParse(json.entries);
+    if (!r.success) return null;
+    return type === 'older'
+      ? { type: 'older', resource, entries: r.data, hasMore }
+      : { type: 'catch_up', resource, entries: r.data };
+  }
   const r = zDeliverableEntries.safeParse(json.entries);
   if (!r.success) return null;
   return type === 'older'
@@ -110,6 +128,10 @@ function parseAppend(json: Record<string, unknown>): Incoming | null {
   if (!resource) return null;
   if (resource === 'transcript') {
     const r = zTranscriptEntry.safeParse(json.entry);
+    return r.success ? { type: 'append', resource, entry: r.data } : null;
+  }
+  if (resource === 'subAgents') {
+    const r = zSubAgentEntry.safeParse(json.entry);
     return r.success ? { type: 'append', resource, entry: r.data } : null;
   }
   const r = zDeliverableEntry.safeParse(json.entry);

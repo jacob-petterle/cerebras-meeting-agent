@@ -1,21 +1,23 @@
 import { type ComponentType, type KeyboardEvent, useMemo, useRef, useState } from 'react';
 import type { SVGProps } from 'react';
-import { IconActivity, IconFile, IconTool, IconTranscript } from '../lib/icons';
+import { IconActivity, IconBot, IconFile, IconTool, IconTranscript } from '../lib/icons';
 import { useHarnessStore } from '../store';
+import { AgentsFeed } from './agents-feed';
 import { DecisionFeed } from './decision-feed';
 import { Deliverables } from './deliverables';
 import { Hud } from './hud';
 import { ToolFeed } from './tool-feed';
 import { Transcript } from './transcript';
 
-type TabKey = 'transcript' | 'brain' | 'tools' | 'deliverables';
+type TabKey = 'transcript' | 'brain' | 'tools' | 'agents' | 'deliverables';
 type IconCmp = ComponentType<SVGProps<SVGSVGElement> & { size?: number }>;
 
-const ORDER: TabKey[] = ['transcript', 'brain', 'tools', 'deliverables'];
+const ORDER: TabKey[] = ['transcript', 'brain', 'tools', 'agents', 'deliverables'];
 const TABS: { key: TabKey; label: string; Icon: IconCmp }[] = [
   { key: 'transcript', label: 'Transcript', Icon: IconTranscript },
   { key: 'brain', label: 'Brain', Icon: IconActivity },
   { key: 'tools', label: 'Tools', Icon: IconTool },
+  { key: 'agents', label: 'Agents', Icon: IconBot },
   { key: 'deliverables', label: 'Deliverables', Icon: IconFile },
 ];
 
@@ -28,6 +30,7 @@ export function Console() {
   const [active, setActive] = useState<TabKey>('transcript');
   const transcript = useHarnessStore((state) => state.transcript);
   const deliverables = useHarnessStore((state) => state.deliverables);
+  const subAgents = useHarnessStore((state) => state.subAgents);
   const decisions = useHarnessStore((state) => state.decisions);
   const tabRefs = useRef<Partial<Record<TabKey, HTMLButtonElement | null>>>({});
 
@@ -39,8 +42,13 @@ export function Console() {
       else convo += 1;
     }
     const ids = new Set(deliverables.map((entry) => entry.data.id));
-    return { transcript: convo, brain: decisions.length, tools, deliverables: ids.size };
-  }, [transcript, deliverables, decisions]);
+    /** Agents count = how many sub-agents are CURRENTLY running (folded latest-per-id) — the live signal. */
+    const latestStatus = new Map<string, string>();
+    for (const entry of subAgents) latestStatus.set(entry.data.id, entry.data.status);
+    let running = 0;
+    for (const status of latestStatus.values()) if (status === 'running') running += 1;
+    return { transcript: convo, brain: decisions.length, tools, agents: running, deliverables: ids.size };
+  }, [transcript, deliverables, subAgents, decisions]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     const idx = ORDER.indexOf(active);
@@ -95,6 +103,7 @@ export function Console() {
           {active === 'transcript' ? <Transcript /> : null}
           {active === 'brain' ? <DecisionFeed /> : null}
           {active === 'tools' ? <ToolFeed /> : null}
+          {active === 'agents' ? <AgentsFeed /> : null}
           {active === 'deliverables' ? <Deliverables /> : null}
         </div>
       </div>

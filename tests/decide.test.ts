@@ -1,13 +1,20 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildResourceMessages,
+  foldLatestById,
   renderDeliverablesResource,
   renderResources,
+  renderSubAgentsResource,
   renderTranscriptResource,
   toDecision,
 } from '../packages/server/src/core/decide';
 import type { AssembledToolCall } from '../packages/server/src/core/cerebras';
-import type { DeliverableRecord, LogEntry, TranscriptEntry } from '@meeting-agent/protocol';
+import {
+  type DeliverableRecord,
+  type LogEntry,
+  SubAgentTaskRecord,
+  type TranscriptEntry,
+} from '@meeting-agent/protocol';
 
 /**
  * decide.ts `toDecision` — the off-contract → no_op funnel. The model can emit an unknown tool, bad
@@ -188,15 +195,104 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
     expect(out).toMatch(/^<deliverables\b[^>]*\/>$/);
   });
 
-  it('renderResources carries current-time + transcript + deliverables', () => {
+  it('renderResources carries current-time + transcript + sub_agents + deliverables', () => {
     const out = renderResources({
       transcript: [tline({ text: 'hi' })],
       newSinceSeqNo: 0,
       deliverables: [dline({})],
+      subAgents: [],
     });
     expect(out).toContain('<current-time iso=');
     expect(out).toContain('<transcript');
+    expect(out).toContain('<sub_agents');
     expect(out).toContain('<deliverables');
+  });
+});
+
+/**
+ * The sub-agent resource (Task #16/#18). Status is an APPEND-ONLY log keyed by id (running → progress
+ * → done/error); the read side folds latest-per-id (last append wins). The render must surface the
+ * running count, the per-task status + latest progress line, and the deliverable link on completion —
+ * this is the live <sub_agents> view the brain observes each beat while research runs non-blocking.
+ */
+const sub = (over: Partial<SubAgentTaskRecord>): SubAgentTaskRecord =>
+  SubAgentTaskRecord.parse({ id: 'a1', status: 'running', task: 'dig', startedAt: 1, ...over });
+
+describe('foldLatestById (append-only status → current state)', () => {
+  it('keeps the LAST append per id (running → done collapses to done)', () => {
+    const items = [
+      sub({ id: 'a1', status: 'running', progress: ['reading'] }),
+      sub({ id: 'a1', status: 'running', progress: ['reading', 'parsing'] }),
+      sub({ id: 'a1', status: 'done', deliverableId: 'd1', endedAt: 9 }),
+    ];
+    const folded = foldLatestById(items);
+    expect(folded).toHaveLength(1);
+    expect(folded[0]!.status).toBe('done');
+    expect(folded[0]!.deliverableId).toBe('d1');
+  });
+
+  it('keeps one row per id, in first-seen order', () => {
+    const items = [
+      sub({ id: 'a1', task: 'first' }),
+      sub({ id: 'a2', task: 'second' }),
+      sub({ id: 'a1', status: 'done', task: 'first' }),
+    ];
+    const folded = foldLatestById(items);
+    expect(folded.map((t) => t.id)).toEqual(['a1', 'a2']);
+    expect(folded[0]!.status).toBe('done');
+  });
+
+  it('returns an empty array for no items', () => {
+    expect(foldLatestById([])).toEqual([]);
+  });
+});
+
+describe('renderSubAgentsResource', () => {
+  it('renders an empty list as a self-closing block with running="0"', () => {
+    const out = renderSubAgentsResource([]);
+    expect(out).toMatch(/^<sub_agents\b[^>]*\/>$/);
+    expect(out).toContain('running="0"');
+  });
+
+  it('renders the running count, a task row, and the latest progress line', () => {
+    const out = renderSubAgentsResource([
+      sub({ id: 'abcdef0123', status: 'running', task: 'audit auth', progress: ['read login.ts', 'found a bug'] }),
+    ]);
+    expect(out).toMatch(/^<sub_agents\b/);
+    expect(out).toContain('running="1"');
+    // Id is shortened to 8 chars; status + task + last progress are surfaced.
+    expect(out).toContain('id="abcdef01"');
+    expect(out).toContain('status="running"');
+    expect(out).toContain('task="audit auth"');
+    expect(out).toContain('last_progress="found a bug"');
+    expect(out).toContain('</sub_agents>');
+  });
+
+  it('folds latest-per-id so a completed run shows done + its deliverable, not running', () => {
+    const out = renderSubAgentsResource([
+      sub({ id: 'a1', status: 'running', task: 'dig' }),
+      sub({ id: 'a1', status: 'done', task: 'dig', deliverableId: 'deadbeef99', endedAt: 5 }),
+    ]);
+    expect(out).toContain('running="0"');
+    expect(out).toContain('status="done"');
+    expect(out).toContain('deliverable="deadbeef99"');
+  });
+
+  it('shows the error message for an errored task', () => {
+    const out = renderSubAgentsResource([
+      sub({ id: 'a1', status: 'error', task: 'dig', error: 'timed out after 180000ms', endedAt: 5 }),
+    ]);
+    expect(out).toContain('status="error"');
+    expect(out).toContain('timed out after 180000ms');
+  });
+
+  it('escapes task/progress so a value cannot break out of the envelope', () => {
+    const out = renderSubAgentsResource([
+      sub({ id: 'a1', task: 'find <script> & "x"', progress: ['<b>hi</b>'] }),
+    ]);
+    expect(out).not.toContain('<script>');
+    expect(out).toContain('&lt;script&gt;');
+    expect(out).toContain('&amp;');
   });
 });
 
@@ -211,6 +307,7 @@ describe('buildResourceMessages — nothing in band', () => {
     transcript: [tline({ text: 'deploy on friday' })],
     newSinceSeqNo: 0,
     deliverables: [dline({ title: 'Risk memo' })],
+    subAgents: [],
   });
 
   it('places the conversation in a system message, never a user turn', () => {
@@ -235,6 +332,7 @@ describe('buildResourceMessages — nothing in band', () => {
     expect(msgs[0]).toMatchObject({ role: 'system', content: 'IDENTITY+CONVENTION' });
     expect(msgs[1]!.role).toBe('system');
     expect(String(msgs[1]!.content)).toContain('<transcript');
+    expect(String(msgs[1]!.content)).toContain('<sub_agents');
     expect(String(msgs[1]!.content)).toContain('<deliverables');
   });
 });

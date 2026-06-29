@@ -24,6 +24,12 @@ const deliverableEntry = {
   data: { id: 'd1', kind: 'html', title: 'Findings', producedAt: 1, registeredAt: 2 },
 };
 
+const subAgentEntry = {
+  seqNo: 0,
+  ts: 1,
+  data: { id: 'a1', status: 'running', task: 'dig', startedAt: 100 },
+};
+
 describe('parseServerMessage — valid frames per type', () => {
   it('parses a transcript catch_up', () => {
     const out = parseServerMessage(
@@ -52,6 +58,35 @@ describe('parseServerMessage — valid frames per type', () => {
       frame({ type: 'append', resource: 'transcript', entry: transcriptEntry }),
     );
     expect(out?.type).toBe('append');
+  });
+
+  it('parses a subAgents catch_up (record defaults fill in)', () => {
+    const out = parseServerMessage(
+      frame({ type: 'catch_up', resource: 'subAgents', entries: [subAgentEntry] }),
+    );
+    expect(out?.type).toBe('catch_up');
+    if (out?.type === 'catch_up' && out.resource === 'subAgents') {
+      expect(out.entries[0]?.data.status).toBe('running');
+      expect(out.entries[0]?.data.progress).toEqual([]);
+      expect(out.entries[0]?.data.deliverableId).toBeNull();
+    }
+  });
+
+  it('parses a subAgents append', () => {
+    const out = parseServerMessage(
+      frame({ type: 'append', resource: 'subAgents', entry: subAgentEntry }),
+    );
+    expect(out?.type).toBe('append');
+    if (out?.type === 'append' && out.resource === 'subAgents') {
+      expect(out.entry.data.task).toBe('dig');
+    }
+  });
+
+  it('returns null when a subAgents entry has an unknown status', () => {
+    const bad = { seqNo: 0, ts: 1, data: { id: 'a1', status: 'paused', task: 't', startedAt: 1 } };
+    expect(
+      parseServerMessage(frame({ type: 'append', resource: 'subAgents', entry: bad })),
+    ).toBeNull();
   });
 
   it('parses an older batch and carries hasMore', () => {
