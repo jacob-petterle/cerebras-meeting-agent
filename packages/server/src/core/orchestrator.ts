@@ -43,6 +43,11 @@ export interface OrchestratorDeps {
   decide: (delta: LogEntry<TranscriptEntry>[]) => Promise<Decision>;
   dispatch: (decision: Decision) => Promise<void>;
   scheduler: Scheduler;
+  /**
+   * Observe EVERY decision the brain makes, including `no_op` (which dispatches nothing). UI-only —
+   * the wiring broadcasts it to the console so a heartbeat that chose silence is still visible.
+   */
+  onDecision?: (decision: Decision) => void;
   /** Heartbeat period; defaults to 5s. Tests inject a manual scheduler and ignore this. */
   intervalMs?: number;
 }
@@ -52,6 +57,11 @@ export interface Orchestrator {
   start(): () => void;
   stop(): void;
   getCursor(): Cursor;
+  /**
+   * Clear the brain's place in the transcript (cursor → -1) and invalidate any in-flight tick so its
+   * completion can't advance the cursor past a span that no longer exists (the logs were just wiped).
+   */
+  reset(): void;
 }
 
 const HEARTBEAT_MS = 5000;
@@ -63,6 +73,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   let cursor = -1;
   let busy = false;
   let unsubscribe: (() => void) | null = null;
+  /** Bumped by reset(); an in-flight tick captures it and only writes the cursor if it still matches. */
+  let generation = 0;
 
   async function tick(): Promise<void> {
     /** Busy lock: an action is in-flight — do not start another. */
@@ -74,6 +86,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     /** Claim the span now, before deciding, so we only ever advance past what we considered. */
     const claimedHead = delta[delta.length - 1]?.seqNo ?? cursor;
 
+    /** Snapshot the generation: if reset() bumps it while we await, we must NOT write the cursor. */
+    const gen = generation;
     busy = true;
 
     /**
@@ -87,13 +101,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       decision = await decide(delta);
     } catch (err) {
       console.error('[orchestrator] decide failed:', err);
-      cursor = claimedHead;
+      if (gen === generation) cursor = claimedHead;
       busy = false;
       return;
     }
 
+    /** Report EVERY decision (incl. no_op) for the console. UI-only — never written to the transcript. */
+    deps.onDecision?.(decision);
+
     if (decision.name === 'no_op') {
-      cursor = claimedHead;
+      if (gen === generation) cursor = claimedHead;
       busy = false;
       return;
     }
@@ -102,16 +119,17 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
      * Detach the dispatch: a slow action (e.g. call_agent) must not block the heartbeat, but the
      * busy lock stays held until it resolves so no second action fires on the claimed span. The
      * cursor advances to claimedHead only — not to the current head — so anything that arrived
-     * mid-action is reprocessed next tick.
+     * mid-action is reprocessed next tick. A reset() during the action bumps `generation`, so the
+     * cursor write below is skipped (the span it pointed at was wiped).
      */
     void dispatch(decision)
       .then(() => {
-        cursor = claimedHead;
+        if (gen === generation) cursor = claimedHead;
       })
       .catch((err: unknown) => {
         /** Action failed: still advance past the claimed span so we don't re-fire it forever. */
         console.error('[orchestrator] dispatch failed:', err);
-        cursor = claimedHead;
+        if (gen === generation) cursor = claimedHead;
       })
       .finally(() => {
         busy = false;
@@ -133,6 +151,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     },
     getCursor() {
       return { transcript: cursor };
+    },
+    reset() {
+      /**
+       * Invalidate any in-flight tick (so its deferred cursor write is dropped) and rewind to the
+       * start. We deliberately do NOT clear `busy`: a dispatch may still be running, and clearing it
+       * would let the next tick start a second action concurrently (the SEV-1 double-fire). The
+       * in-flight action's `.finally` releases `busy` normally; its cursor write is skipped by `gen`.
+       */
+      generation += 1;
+      cursor = -1;
     },
   };
 }

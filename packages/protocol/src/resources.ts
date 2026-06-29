@@ -60,7 +60,9 @@ export type ResourceName = 'transcript' | 'deliverables';
 export type ClientMsg =
   | { type: 'subscribe'; resource: ResourceName; sinceSeqNo: number }
   | { type: 'fetch_older'; resource: ResourceName; beforeSeqNo: number; limit: number }
-  | { type: 'pcm'; participantId: string; sampleRate: number; ts: number; pcm: number[] };
+  | { type: 'pcm'; participantId: string; sampleRate: number; ts: number; pcm: number[] }
+  /** Clear the session: wipe the transcript + deliverables logs and reset the brain's cursor. */
+  | { type: 'reset' };
 
 /** Server → client. `catch_up`/`older` mirror schema.ts:330-363; `append` is the live push. */
 export type ServerMsg =
@@ -69,4 +71,8 @@ export type ServerMsg =
   | { type: 'older'; resource: ResourceName; entries: LogEntry<unknown>[]; hasMore: boolean }
   | { type: 'render'; cmd: RenderCommand }
   | { type: 'play'; sampleRate: number; pcm: number[] }
-  | { type: 'stats'; tokensPerSec: number | null; promptTokens: number; completionTokens: number };
+  | { type: 'stats'; tokensPerSec: number | null; promptTokens: number; completionTokens: number }
+  /** Every heartbeat decision (incl. no_op) for the observability console. UI-only — never the transcript. */
+  | { type: 'decision'; name: string; detail: string; ts: number }
+  /** Broadcast after a `reset` so every client clears its view. */
+  | { type: 'reset' };

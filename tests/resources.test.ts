@@ -58,6 +58,24 @@ describe('AppendLog', () => {
     snap.pop();
     expect(log.snapshot().map((e) => e.data)).toEqual(['a']);
   });
+
+  it('reset() clears entries (seqNo restarts at 0) and keeps live subscribers', () => {
+    const log = createAppendLog<string>();
+    const live: string[] = [];
+    log.subscribe((e) => live.push(`${e.seqNo}:${e.data}`));
+    log.append('a'); // 0
+    log.append('b'); // 1
+    expect(log.head()).toBe(1);
+
+    log.reset();
+    expect(log.head()).toBe(-1);
+    expect(log.snapshot()).toEqual([]);
+    expect(log.since(-1)).toEqual([]);
+
+    // The subscriber survived the reset, and seqNo restarts at 0 for the next append.
+    expect(log.append('c')).toBe(0);
+    expect(live).toEqual(['0:a', '1:b', '0:c']);
+  });
 });
 
 describe('deliverables resource', () => {

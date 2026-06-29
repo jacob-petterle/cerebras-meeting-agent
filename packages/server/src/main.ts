@@ -1,8 +1,9 @@
 import { fileURLToPath } from 'node:url';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
-import { createDecide } from './core/decide';
-import { createOrchestrator, intervalScheduler } from './core/orchestrator';
+import { createDecide, type Decision } from './core/decide';
+import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
+import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
 import { createCallAgentMock } from './core/tools/callAgent/mock';
 import { createVad, createStt, createTts } from './media';
@@ -26,6 +27,29 @@ const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
 const SESSION_CONTEXT =
   process.env.SESSION_CONTEXT ??
   'A local test session. One human participant ("me") is speaking into a microphone. No specific project is in scope yet — be a generally helpful collaborator.';
+
+/** Read a string field off a parsed (but `unknown`-typed) tool-args object without an assertion. */
+function argField(args: unknown, key: string): string {
+  if (!isRecord(args)) return '';
+  const value = args[key];
+  return typeof value === 'string' ? value : '';
+}
+
+/** A short, human-readable description of a decision for the console feed (incl. no_op's reason). */
+function summarizeDecision(d: Decision): string {
+  switch (d.name) {
+    case 'no_op':
+      return argField(d.args, 'reason') || '(staying silent)';
+    case 'speak':
+      return argField(d.args, 'text');
+    case 'share_screen':
+      return argField(d.args, 'title') || argField(d.args, 'kind') || 'artifact';
+    case 'call_agent':
+      return argField(d.args, 'task');
+    default:
+      return '';
+  }
+}
 
 async function main(): Promise<void> {
   // Load env (Node >= 20.12 / 22). `pnpm dev` runs with cwd=packages/server (pnpm --filter), so the
@@ -52,7 +76,18 @@ async function main(): Promise<void> {
 
   // Transport: AudioIn source + WS server + AudioOut/Display adapters over the same socket.
   const { port: audioIn, deliver } = createAudioInWs();
-  const ws = createWsServer({ resources, onPcm: deliver, port: PORT });
+  /** Set once the brain is enabled; the reset handler rewinds its cursor when a client clears the session. */
+  let orchestratorRef: Orchestrator | null = null;
+  const ws = createWsServer({
+    resources,
+    onPcm: deliver,
+    onReset: () => {
+      resources.transcript.reset();
+      resources.deliverables.reset();
+      orchestratorRef?.reset();
+    },
+    port: PORT,
+  });
   const ports: Ports = {
     audioIn,
     audioOut: createAudioOutWs(ws),
@@ -131,8 +166,12 @@ async function main(): Promise<void> {
           timestamp: Date.now(),
         });
       },
+      /** Surface EVERY decision (incl. no_op) to the console's decision feed — UI-only, not the transcript. */
+      onDecision: (decision) =>
+        ws.broadcastDecision({ name: decision.name, detail: summarizeDecision(decision), ts: Date.now() }),
       scheduler: intervalScheduler(),
     });
+    orchestratorRef = orchestrator;
     stopHeartbeat = orchestrator.start();
     console.log('[main] brain enabled (Gemma on Cerebras). Start the web app (pnpm web) and talk.');
   } else {

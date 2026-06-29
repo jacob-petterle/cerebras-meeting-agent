@@ -21,6 +21,8 @@ export interface AppendLog<T> {
   snapshot(): LogEntry<T>[];
   /** Subscribe to live appends. The callback fires once per future append. Returns an unsubscribe. */
   subscribe(cb: (entry: LogEntry<T>) => void): () => void;
+  /** Clear all entries (seqNo restarts at 0 on the next append). Subscribers stay subscribed. */
+  reset(): void;
 }
 
 export function createAppendLog<T>(): AppendLog<T> {
@@ -56,6 +58,11 @@ export function createAppendLog<T>(): AppendLog<T> {
       return () => {
         subscribers.delete(cb);
       };
+    },
+
+    reset(): void {
+      /** Truncate in place; the next append is seqNo 0 again. Clients are told to reset their hwm. */
+      entries.length = 0;
     },
   };
 }

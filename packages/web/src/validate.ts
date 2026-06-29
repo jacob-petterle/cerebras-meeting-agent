@@ -57,6 +57,8 @@ const zStats = z.object({
   promptTokens: z.number(),
   completionTokens: z.number(),
 });
+/** A brain decision (incl. no_op) for the console feed. */
+const zDecision = z.object({ name: z.string(), detail: z.string(), ts: z.number() });
 
 /** A validated, typed inbound frame. Closed union -- ws.ts handles it exhaustively. */
 export type Incoming =
@@ -73,7 +75,9 @@ export type Incoming =
     }
   | { type: 'render'; cmd: RenderCommand }
   | { type: 'play'; sampleRate: number; pcm: number[] }
-  | { type: 'stats'; stats: ServerStats };
+  | { type: 'stats'; stats: ServerStats }
+  | { type: 'decision'; name: string; detail: string; ts: number }
+  | { type: 'reset' };
 
 function parseResource(value: unknown): ResourceName | null {
   return value === 'transcript' || value === 'deliverables' ? value : null;
@@ -142,6 +146,12 @@ export function parseServerMessage(raw: unknown): Incoming | null {
       const r = zStats.safeParse(json);
       return r.success ? { type: 'stats', stats: r.data } : null;
     }
+    case 'decision': {
+      const r = zDecision.safeParse(json);
+      return r.success ? { type: 'decision', name: r.data.name, detail: r.data.detail, ts: r.data.ts } : null;
+    }
+    case 'reset':
+      return { type: 'reset' };
     default:
       return null;
   }
