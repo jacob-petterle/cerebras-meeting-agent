@@ -1,5 +1,5 @@
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, foldLatestById, type Decision } from './core/decide';
@@ -44,13 +44,16 @@ const BOT_TTS_PORT = Number(process.env.BOT_TTS_PORT ?? 3001);
 const EXCLUDE_NODE_ID = process.env.EXCLUDE_NODE_ID || undefined;
 /** Verbose per-frame pipeline logging (high-frequency). Off by default; `DEBUG_PIPE=1` to enable. */
 const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
+/** Repo root (…/cerebras-hackathon-prep), three up from packages/server/src/main.ts. */
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 /**
- * Where the Cursor research sub-agent runs. Default = the HOME directory so it can read ANY repo on
- * the machine (e.g. ~/repos/shipyard) — not just this one. Starting it in the meeting-agent repo
- * (process.cwd()) is why "investigate the Shipyard codebase" timed out: it couldn't see those files.
- * Override with CURSOR_AGENT_CWD (e.g. point it at ~/repos for a tighter scope).
+ * Where the Cursor research sub-agent runs — and what ripgrep searches. Default = THIS repo: a real
+ * git tree with a .gitignore, which a real research task investigates in ~15s (proven). The HOME
+ * directory was the prior default, but ripgrep then traverses all of ~ (huge, no root .gitignore) and
+ * the run drags — the opposite of what a live agent needs. Override with CURSOR_AGENT_CWD to widen the
+ * scope (e.g. ~/repos for cross-repo research); a tree without a sane .gitignore will be slower.
  */
-const CURSOR_AGENT_CWD = process.env.CURSOR_AGENT_CWD || homedir();
+const CURSOR_AGENT_CWD = process.env.CURSOR_AGENT_CWD || REPO_ROOT;
 const SESSION_CONTEXT =
   process.env.SESSION_CONTEXT ??
   'A local test session. One human participant ("me") is speaking into a microphone. No specific project is in scope yet — be a generally helpful collaborator.';
@@ -296,17 +299,19 @@ async function main(): Promise<void> {
           deliverables: resources.deliverables,
           /** Live status (running → progress → done/error) so the heartbeat observes the run, never blocks on it. */
           subAgents: resources.subAgents,
-          outDir: '.deliverables',
+          outDir: join(REPO_ROOT, '.deliverables'),
           apiKey: cursorKey,
           cwd: CURSOR_AGENT_CWD,
+          /** Optional model override; defaults to composer-2.5 (fast mode) in cursor.ts. */
+          model: process.env.CURSOR_AGENT_MODEL || undefined,
           onProgress: (l) => console.log(l),
         })
       : createCallAgentMock({
           deliverables: resources.deliverables,
-          outDir: '.deliverables',
+          outDir: join(REPO_ROOT, '.deliverables'),
         });
     console.log(
-      `[main] call_agent: ${cursorKey ? `real Cursor SDK (cwd=${CURSOR_AGENT_CWD})` : 'mock'}`,
+      `[main] call_agent: ${cursorKey ? `real Cursor SDK — ${process.env.CURSOR_AGENT_MODEL || 'composer-2.5'} (fast), cwd=${CURSOR_AGENT_CWD}` : 'mock'}`,
     );
     const registry = createRegistry({
       ports,

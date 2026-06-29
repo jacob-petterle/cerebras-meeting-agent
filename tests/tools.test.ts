@@ -229,16 +229,18 @@ describe('call_agent mock', () => {
       const rec = await mock({ task: 'investigate the flaky test' });
       const elapsed = Date.now() - t0;
 
+      // the mock always produces a real deliverable (never the null "no findings" path)
+      expect(rec).not.toBeNull();
       // matches the shared schema
       expect(() => DeliverableRecord.parse(rec)).not.toThrow();
-      expect(rec.kind).toBe('html');
+      expect(rec!.kind).toBe('html');
 
       // filePath is real and on disk
-      expect(rec.filePath).toBeTruthy();
-      expect(existsSync(rec.filePath ?? '')).toBe(true);
+      expect(rec!.filePath).toBeTruthy();
+      expect(existsSync(rec!.filePath ?? '')).toBe(true);
 
       // surfaced on the deliverables log
-      expect(deliverables.snapshot().map((e) => e.data.id)).toContain(rec.id);
+      expect(deliverables.snapshot().map((e) => e.data.id)).toContain(rec!.id);
 
       // fast enough for a live turn
       expect(elapsed).toBeLessThan(1000);

@@ -18,11 +18,10 @@ import {
 
 /**
  * cursor.ts — the real Cursor SDK sub-agent, driven with an INJECTED fake agent so the test never
- * touches the network or spends Cursor credits. The fake mirrors the slice of `@cursor/sdk` cursor.ts
- * drives: an agent that returns a `Run` whose `stream()` yields `SDKMessage`-shaped events and whose
- * `wait()` resolves a `RunResult`. We assert the four behaviors the contract guarantees: streams to
- * onProgress, uses the agent-written file when present, falls back to a synthesized file when absent,
- * and turns timeout/error into a renderable fallback deliverable (never a throw).
+ * touches the network or spends Cursor credits. We assert the NO-FALLBACKS contract: a run either
+ * produces a real agent-written findings file (→ a deliverable + `done` status) or it produces nothing
+ * (→ NO deliverable + `error` status, and a `null` return). It never fabricates a placeholder, and it
+ * never throws out of dispatch.
  */
 
 /** A fake SDKMessage stream — yields the given events, then completes. */
@@ -55,11 +54,33 @@ function fakeRun(opts: FakeRunOptions): CursorRun {
   };
 }
 
-/** A fake agent factory whose `send` returns the supplied run; records prompt + close for assertions. */
-function fakeFactory(run: CursorRun, spies: { closed: () => void; prompt: (p: string) => void }) {
+/** A factory whose `send` returns the run WITHOUT writing a findings file (the no-file / failure path). */
+function nonWritingFactory(run: CursorRun, spies: { closed: () => void; prompt: (p: string) => void }) {
   const agent: CursorAgent = {
     send: async (prompt: string) => {
       spies.prompt(prompt);
+      return run;
+    },
+    close: () => spies.closed(),
+  };
+  return async () => agent;
+}
+
+/**
+ * A factory whose `send` WRITES the findings file the prompt names (the success path). The prompt
+ * carries the absolute FINDINGS-*.html path; we extract the basename and write into `dir` (which is
+ * the resolved outDir), exactly where cursor.ts will read it back.
+ */
+function writingFactory(
+  dir: string,
+  run: CursorRun,
+  spies: { closed: () => void; prompt: (p: string) => void } = { closed: () => {}, prompt: () => {} },
+) {
+  const agent: CursorAgent = {
+    send: async (prompt: string) => {
+      spies.prompt(prompt);
+      const match = prompt.match(/FINDINGS-[0-9a-f-]+\.html/);
+      if (match) writeFileSync(join(dir, match[0]), '<h1>Agent-written findings</h1>', 'utf-8');
       return run;
     },
     close: () => spies.closed(),
@@ -83,30 +104,19 @@ describe('call_agent (real Cursor SDK, injected fake agent)', () => {
       const closed = vi.fn();
       const prompt = vi.fn();
 
-      // The fake agent "writes" the exact findings file the prompt asked for, mid-run.
       const events = [
         { type: 'status', status: 'RUNNING' },
         { type: 'thinking', text: 'reading files' },
         { type: 'tool_call', name: 'read', status: 'completed' },
         { type: 'assistant', message: { content: [{ type: 'text', text: 'found the cause' }] } },
       ];
-      // Capture the path from the prompt and write to it, simulating the agent's file write.
       const run = fakeRun({ events, result: { status: 'finished', result: 'The bug is a race in foo.ts' } });
-      const factory = async () => ({
-        send: async (p: string) => {
-          prompt(p);
-          const match = p.match(/FINDINGS-[0-9a-f-]+\.html/);
-          if (match) writeFileSync(join(dir, match[0]), '<h1>Agent-written findings</h1>', 'utf-8');
-          return run;
-        },
-        close: () => closed(),
-      });
 
       const callAgent = createCallAgentCursor({
         ...deps,
         timeoutMs: 5000,
         onProgress: (l) => progress.push(l),
-        agentFactory: factory,
+        agentFactory: writingFactory(dir, run, { closed, prompt }),
       });
 
       const rec = await callAgent({ task: 'why is the test flaky' });
@@ -116,80 +126,71 @@ describe('call_agent (real Cursor SDK, injected fake agent)', () => {
       expect(progress.some((l) => l.includes('read'))).toBe(true);
       expect(progress.some((l) => l.includes('RUNNING'))).toBe(true);
 
-      // The deliverable points at the AGENT-WRITTEN file (real findings, not a fallback).
+      // The deliverable points at the AGENT-WRITTEN file (real findings).
+      expect(rec).not.toBeNull();
       expect(() => DeliverableRecord.parse(rec)).not.toThrow();
-      expect(rec.kind).toBe('html');
-      expect(rec.filePath).toBeTruthy();
-      expect(readFileSync(rec.filePath ?? '', 'utf-8')).toContain('Agent-written findings');
+      expect(rec!.kind).toBe('html');
+      expect(rec!.filePath).toBeTruthy();
+      expect(readFileSync(rec!.filePath ?? '', 'utf-8')).toContain('Agent-written findings');
       // Description derives from the run summary.
-      expect(rec.description).toContain('race in foo.ts');
+      expect(rec!.description).toContain('race in foo.ts');
       // Appended to the deliverables log and the agent was closed.
-      expect(deps.deliverables.snapshot().map((e) => e.data.id)).toContain(rec.id);
+      expect(deps.deliverables.snapshot().map((e) => e.data.id)).toContain(rec!.id);
       expect(closed).toHaveBeenCalledTimes(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('synthesizes a fallback HTML file from the run summary when the agent did not write one', async () => {
+  it('finished but no findings file written → null, NO deliverable (no fallback)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
     try {
       const deps = baseDeps(dir);
       const closed = vi.fn();
-      // Run finishes but never writes the file.
+      // Run finishes but the agent never writes the file.
       const run = fakeRun({ result: { status: 'finished', result: 'Summary: the cache is stale.' } });
       const callAgent = createCallAgentCursor({
         ...deps,
-        agentFactory: fakeFactory(run, { closed, prompt: () => {} }),
+        onProgress: () => {},
+        agentFactory: nonWritingFactory(run, { closed, prompt: () => {} }),
       });
 
       const rec = await callAgent({ task: 'investigate stale cache' });
 
-      expect(rec.kind).toBe('html');
-      expect(rec.filePath).toBeTruthy();
-      const html = readFileSync(rec.filePath ?? '', 'utf-8');
-      // The fallback page is built from the summary text and is valid standalone HTML.
-      expect(html).toContain('<!doctype html>');
-      expect(html).toContain('the cache is stale');
-      expect(html).toContain('did not write a findings file');
-      expect(deps.deliverables.snapshot()).toHaveLength(1);
+      expect(rec).toBeNull();
+      expect(deps.deliverables.snapshot()).toHaveLength(0);
       expect(closed).toHaveBeenCalledTimes(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('on timeout: cancels the run and still produces a fallback deliverable (never throws)', async () => {
+  it('on timeout: cancels the run, returns null, registers NO deliverable (never throws)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
     try {
       const deps = baseDeps(dir);
       const cancelled = vi.fn();
       const closed = vi.fn();
-      // The run hangs (wait never resolves) → the wall-clock timeout fires.
       const run = fakeRun({ hang: true, supportsCancel: true, onCancel: cancelled });
       const callAgent = createCallAgentCursor({
         ...deps,
         timeoutMs: 20, // tiny budget so the test is fast
         onProgress: () => {},
-        agentFactory: fakeFactory(run, { closed, prompt: () => {} }),
+        agentFactory: nonWritingFactory(run, { closed, prompt: () => {} }),
       });
 
       const rec = await callAgent({ task: 'a task that hangs' });
 
       expect(cancelled).toHaveBeenCalledTimes(1);
-      expect(rec.kind).toBe('html');
-      expect(rec.filePath).toBeTruthy();
-      const html = readFileSync(rec.filePath ?? '', 'utf-8');
-      expect(html).toContain('timed out');
-      expect(rec.description).toContain('timed out');
-      expect(deps.deliverables.snapshot()).toHaveLength(1);
+      expect(rec).toBeNull();
+      expect(deps.deliverables.snapshot()).toHaveLength(0);
       expect(closed).toHaveBeenCalledTimes(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('on agent failure: logs and returns a fallback deliverable, never throwing out of dispatch', async () => {
+  it('on agent failure: logs, returns null, registers NO deliverable (never throws out of dispatch)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
@@ -205,12 +206,8 @@ describe('call_agent (real Cursor SDK, injected fake agent)', () => {
 
       const rec = await callAgent({ task: 'anything' });
 
-      expect(() => DeliverableRecord.parse(rec)).not.toThrow();
-      expect(rec.kind).toBe('html');
-      expect(rec.description).toContain('failed');
-      const html = readFileSync(rec.filePath ?? '', 'utf-8');
-      expect(html).toContain('auth failed');
-      expect(deps.deliverables.snapshot()).toHaveLength(1);
+      expect(rec).toBeNull();
+      expect(deps.deliverables.snapshot()).toHaveLength(0);
       expect(errSpy).toHaveBeenCalled();
     } finally {
       errSpy.mockRestore();
@@ -221,10 +218,10 @@ describe('call_agent (real Cursor SDK, injected fake agent)', () => {
 
 /**
  * Sub-agent status emission (#16/#18) — driven with the SAME injected fake agent (NO live Cursor run,
- * no credits). When a `subAgents` log is injected, the call must emit status as APPENDS keyed by the
- * run id: a `running` record before the run, fresh `running` records as progress streams, then a
- * terminal `done` (success) or `error` (timeout/failure). The deliverable id and the terminal
- * `deliverableId` must match (same minted id). This is what lets the heartbeat observe the run live.
+ * no credits). When a `subAgents` log is injected, the call emits status as APPENDS keyed by the run
+ * id: a `running` record before the run, fresh `running` records as progress streams, then a terminal
+ * `done` (real findings written) or `error` (timeout/failure/no-file). The deliverable id and the
+ * terminal `deliverableId` must match. This is what lets the heartbeat observe the run live.
  */
 describe('call_agent sub-agent status emission (running → done / error)', () => {
   const latest = (log: ReturnType<typeof createAppendLog<SubAgentTaskRecordT>>): SubAgentTaskRecordT[] =>
@@ -246,10 +243,12 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
         apiKey: 'crsr_test',
         cwd: dir,
         onProgress: () => {},
-        agentFactory: fakeFactory(run, { closed: () => {}, prompt: () => {} }),
+        // Success path: the agent writes the findings file.
+        agentFactory: writingFactory(dir, run),
       });
 
       const rec = await callAgent({ task: 'check the build' });
+      expect(rec).not.toBeNull();
 
       // The FIRST append is a running record (announced before agent.send).
       const all = subAgents.snapshot().map((e) => e.data);
@@ -259,14 +258,14 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
       // The folded (latest) state is `done`, linked to the produced deliverable by id.
       const [current] = latest(subAgents);
       expect(current!.status).toBe('done');
-      expect(current!.deliverableId).toBe(rec.id);
+      expect(current!.deliverableId).toBe(rec!.id);
       expect(current!.endedAt).not.toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('emits a terminal error status on timeout (the run hangs)', async () => {
+  it('emits a terminal error status (and NO deliverable) on timeout', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
     try {
       const deliverables = createAppendLog<DeliverableRecordT>();
@@ -280,11 +279,13 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
         cwd: dir,
         timeoutMs: 20,
         onProgress: () => {},
-        agentFactory: fakeFactory(run, { closed: () => {}, prompt: () => {} }),
+        agentFactory: nonWritingFactory(run, { closed: () => {}, prompt: () => {} }),
       });
 
-      await callAgent({ task: 'a hang' });
+      const rec = await callAgent({ task: 'a hang' });
 
+      expect(rec).toBeNull();
+      expect(deliverables.snapshot()).toHaveLength(0);
       const [current] = latest(subAgents);
       expect(current!.status).toBe('error');
       expect(current!.error).toContain('Timed out');
@@ -294,7 +295,7 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
     }
   });
 
-  it('emits a terminal error status when the agent factory throws', async () => {
+  it('emits a terminal error status (and NO deliverable) when the agent factory throws', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
@@ -312,8 +313,10 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
         },
       });
 
-      await callAgent({ task: 'anything' });
+      const rec = await callAgent({ task: 'anything' });
 
+      expect(rec).toBeNull();
+      expect(deliverables.snapshot()).toHaveLength(0);
       const [current] = latest(subAgents);
       expect(current!.status).toBe('error');
       expect(current!.error).toContain('auth failed');
@@ -323,7 +326,7 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
     }
   });
 
-  it('works without a subAgents log (existing unit-test path): no status, deliverable unchanged', async () => {
+  it('works without a subAgents log (existing unit-test path): success → one deliverable, no crash', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
     try {
       const deliverables = createAppendLog<DeliverableRecordT>();
@@ -334,11 +337,12 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
         apiKey: 'crsr_test',
         cwd: dir,
         onProgress: () => {},
-        agentFactory: fakeFactory(run, { closed: () => {}, prompt: () => {} }),
+        agentFactory: writingFactory(dir, run),
       });
 
       const rec = await callAgent({ task: 'no status please' });
-      expect(rec.kind).toBe('html');
+      expect(rec).not.toBeNull();
+      expect(rec!.kind).toBe('html');
       expect(deliverables.snapshot()).toHaveLength(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });

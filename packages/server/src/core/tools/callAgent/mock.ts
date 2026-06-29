@@ -19,7 +19,11 @@ export interface CallAgentMockDeps {
   outDir: string;
 }
 
-export type CallAgentFn = (args: CallAgentArgs) => Promise<DeliverableRecord>;
+/**
+ * `null` is the "no findings" result — the real Cursor sub-agent returns it on any failure (timeout,
+ * error, no file written) rather than fabricating a fallback deliverable. The mock always succeeds.
+ */
+export type CallAgentFn = (args: CallAgentArgs) => Promise<DeliverableRecord | null>;
 
 function findingsHtml(task: string): string {
   const safe = task.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

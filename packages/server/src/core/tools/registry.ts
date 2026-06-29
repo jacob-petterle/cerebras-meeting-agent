@@ -40,7 +40,8 @@ export interface TurnOutcome {
 export interface RegistryDeps {
   ports: Ports;
   tts: TtsFn;
-  callAgent: (args: CallAgentArgs) => Promise<DeliverableRecord>;
+  /** Returns the findings deliverable, or `null` when the research produced none (no fallbacks). */
+  callAgent: (args: CallAgentArgs) => Promise<DeliverableRecord | null>;
   /**
    * The deliverables log, for resolving `share_screen { deliverableId }` to the actual sub-agent
    * findings file server-side. Optional: when omitted (e.g. unit tests that don't exercise this),
@@ -116,6 +117,12 @@ export function createRegistry(deps: RegistryDeps): ToolRegistry {
         case 'call_agent': {
           const args = TOOL_ARGS.call_agent.parse(call.args);
           const deliverable = await deps.callAgent(args);
+          /**
+           * No deliverable → the research produced no findings (timeout/error, no fallbacks). Append
+           * nothing to the transcript; the brain already observed the terminal `error` on the
+           * <sub_agents> resource and can decide whether to retry.
+           */
+          if (!deliverable) return null;
           return {
             senderKind: 'tool',
             text: `researched: ${args.task} (deliverable ${deliverable.id})`,
