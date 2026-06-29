@@ -110,6 +110,20 @@ function OfflineBanner() {
 }
 
 export function App() {
+  // Stage-only mode: `?view=stage` renders JUST the deliverable surface, full-viewport, with no
+  // header/console/HUD. The Zoom bot's headless Chromium loads this URL so the screenshare shows
+  // only the shared artifact — not the whole operator console.
+  const stageOnly =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('view') === 'stage';
+  if (stageOnly) {
+    return (
+      <div className="stage-only">
+        <Stage />
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <header className="topbar">
