@@ -317,6 +317,12 @@ async function main(): Promise<void> {
     });
     const orchestrator = createOrchestrator({
       transcript: resources.transcript,
+      /**
+       * Step ONE of every beat: drain the raw STT buffer, correct it, and append the cleaned lines to
+       * the transcript BEFORE the brain reads it. WITHOUT this, the buffered raw STT never drains and
+       * the transcript stays empty — the brain-enabled path has no other writer to the transcript.
+       */
+      correct,
       decide,
       /**
        * Dispatch wrapper: run the tool, then write the outcome back to the transcript so (a) the
