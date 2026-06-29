@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { assembleStream } from '../packages/server/src/core/cerebras';
 import type { StreamChunk } from '../packages/server/src/core/cerebras';
-import { decisionFromResult } from '../packages/server/src/core/decide';
+import { decisionsFromResult } from '../packages/server/src/core/decide';
 
 async function* feed(chunks: StreamChunk[]): AsyncGenerator<StreamChunk> {
   for (const c of chunks) yield c;
@@ -90,13 +90,13 @@ describe('cerebras assembleStream (tool_calls accumulated by index)', () => {
     expect(result.tokensPerSec).toBeNull();
   });
 
-  it('a stream with no tool_calls → decisionFromResult → no_op', async () => {
+  it('a stream with no tool_calls → decisionsFromResult → [no_op]', async () => {
     const chunks: StreamChunk[] = [
       { choices: [{ delta: { content: 'just chatting' } }] },
       { choices: [{ delta: {}, finish_reason: 'stop' }] },
     ];
     const result = await assembleStream(feed(chunks));
-    expect(decisionFromResult(result)).toEqual({ name: 'no_op', args: {} });
+    expect(decisionsFromResult(result)).toEqual([{ name: 'no_op', args: {} }]);
   });
 
   it('tokensPerSec is null (not 0) when completion_tokens is 0, even with elapsed time', async () => {

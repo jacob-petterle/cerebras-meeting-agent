@@ -52,7 +52,12 @@ export interface Cursor {
 
 export interface OrchestratorDeps {
   transcript: AppendLog<TranscriptEntry>;
-  decide: (delta: LogEntry<TranscriptEntry>[]) => Promise<Decision>;
+  /**
+   * Run the brain over the transcript delta. Returns a BATCH of decisions: the model may emit several
+   * tool calls in one beat (parallel fan-out). A single `Decision` is accepted too (treated as a
+   * one-element batch) so callers/tests that hand back one decision keep working unchanged.
+   */
+  decide: (delta: LogEntry<TranscriptEntry>[]) => Promise<Decision | Decision[]>;
   dispatch: (decision: Decision) => Promise<void>;
   scheduler: Scheduler;
   /**
@@ -188,10 +193,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
      * MUST advance past the claimed span — otherwise the heartbeat wedges forever and the same delta is
      * re-decided on a loop. On a decide error we fall through to the no-op path: advance, release, return.
      */
-    let decision: Decision;
+    let decisions: Decision[];
     deps.onThinkingChange?.(true);
     try {
-      decision = await decide(delta);
+      const raw = await decide(delta);
+      /** `decide` may return ONE decision or a BATCH (parallel tool calls in a single response). */
+      decisions = Array.isArray(raw) ? raw : [raw];
     } catch (err) {
       console.error('[orchestrator] decide failed:', err);
       deps.onThinkingChange?.(false);
@@ -201,29 +208,21 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     }
     deps.onThinkingChange?.(false);
 
-    /** Runaway guard: too many back-to-back actions with no human input → force a yield this beat. */
-    if (decision.name !== 'no_op' && turnActions >= MAX_TURN_ACTIONS) {
-      console.warn(`[orchestrator] turn action cap (${MAX_TURN_ACTIONS}) reached — forcing no_op to yield`);
-      decision = { name: 'no_op', args: { reason: 'turn action cap reached' } };
-    }
-
     /** Report EVERY decision (incl. no_op) for the console. UI-only — never written to the transcript. */
-    deps.onDecision?.(decision);
+    for (const d of decisions) deps.onDecision?.(d);
 
-    if (decision.name === 'no_op' || decision.name === 'sleep') {
-      /**
-       * Both END the turn (advance the cursor, reset the counter, do NOT continue). `sleep` additionally
-       * mutes the idle heartbeat for a clamped window, so the agent isn't re-prompted while it has
-       * deliberately stood down — a person speaking or a research result wakes it early (see poke/subscribe).
-       */
-      if (decision.name === 'sleep') {
-        const requested = Number((decision.args as { seconds?: unknown }).seconds);
-        const seconds = Number.isFinite(requested)
-          ? Math.min(SLEEP_MAX_SECONDS, Math.max(SLEEP_MIN_SECONDS, requested))
-          : SLEEP_MIN_SECONDS;
-        mutedUntil = Date.now() + seconds * 1000;
-        console.log(`[orchestrator] sleep ${seconds}s — idle heartbeat muted until a person speaks or research lands`);
-      }
+    /**
+     * Split the batch: ACTIONS (speak/share_screen/call_agent) get dispatched; a no_op or sleep is a
+     * YIELD. The model may now fire SEVERAL actions in one beat — true parallel fan-out, e.g. three
+     * research agents at once. A single decision is just a one-element batch, so the common case is
+     * unchanged.
+     */
+    const actions = decisions.filter((d) => d.name !== 'no_op' && d.name !== 'sleep');
+    const sleepDecision = decisions.find((d) => d.name === 'sleep');
+
+    /** Runaway guard: too many back-to-back actions with no human input → force a yield this beat. */
+    if (actions.length > 0 && turnActions >= MAX_TURN_ACTIONS) {
+      console.warn(`[orchestrator] turn action cap (${MAX_TURN_ACTIONS}) reached — forcing no_op to yield`);
       turnActions = 0;
       if (gen === generation) cursor = claimedHead;
       busy = false;
@@ -231,26 +230,42 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     }
 
     /**
-     * Any non-no_op action — speak, share_screen, call_agent — is FIRE-AND-FORGET: advance the cursor +
-     * release the lock NOW, then dispatch DETACHED so the heartbeat never blocks on the tool. A reset()
-     * during decide() bumps `generation`, so the cursor write is skipped (the span it pointed at was wiped).
-     *
-     * The turn continues until no_op, but HOW the next beat is armed differs by tool:
-     *   • call_agent has no transcript write-back until its (long) run finishes, so we eagerly arm the
-     *     next beat here — that's what lets the brain immediately fan out more parallel research or speak
-     *     a follow-up WHILE the run works in the background.
-     *   • speak / share_screen continue via their transcript write-back instead: the agent's own line
-     *     echoes back next beat as kind="agent" (memory), so it can "acknowledge → THEN act" exactly as
-     *     the identity prompt describes. main.ts pokes us the moment that write-back lands, so it stays
-     *     snappy without an eager, memory-less beat that could make the brain repeat itself.
+     * Advance the cursor + release the lock BEFORE dispatching: every tool is FIRE-AND-FORGET, so
+     * nothing here blocks the heartbeat. A reset() during decide() bumps `generation`, so the cursor
+     * write is skipped (the span it pointed at was wiped). Each action is dispatched DETACHED, in order.
      */
-    turnActions += 1;
+    turnActions += actions.length;
     if (gen === generation) cursor = claimedHead;
     busy = false;
-    void dispatch(decision).catch((err: unknown) => {
-      console.error('[orchestrator] dispatch failed (detached):', err);
-    });
-    if (decision.name === 'call_agent') {
+    for (const action of actions) {
+      void dispatch(action).catch((err: unknown) => {
+        console.error('[orchestrator] dispatch failed (detached):', err);
+      });
+    }
+
+    /**
+     * Turn end vs continue:
+     *   • `sleep` in the batch → mute the idle heartbeat for its window and END the turn.
+     *   • a `no_op` in the batch, or NO actions at all → END the turn (an explicit yield).
+     *   • otherwise (≥1 action, no yield) the turn continues. A call_agent in the batch eagerly arms the
+     *     next beat so the brain can keep fanning out WHILE runs work in the background; speak/share
+     *     continue via their transcript write-back poke (main.ts) — no memory-less echo beat.
+     */
+    if (sleepDecision) {
+      const requested = Number((sleepDecision.args as { seconds?: unknown }).seconds);
+      const seconds = Number.isFinite(requested)
+        ? Math.min(SLEEP_MAX_SECONDS, Math.max(SLEEP_MIN_SECONDS, requested))
+        : SLEEP_MIN_SECONDS;
+      mutedUntil = Date.now() + seconds * 1000;
+      console.log(`[orchestrator] sleep ${seconds}s — idle heartbeat muted until a person speaks or research lands`);
+      turnActions = 0;
+      return;
+    }
+    if (actions.length === 0 || decisions.some((d) => d.name === 'no_op')) {
+      turnActions = 0;
+      return;
+    }
+    if (actions.some((d) => d.name === 'call_agent')) {
       pendingWake = true;
       scheduleBeat();
     }

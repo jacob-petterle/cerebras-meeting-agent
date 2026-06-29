@@ -14,6 +14,7 @@ import {
 import { buildSystemPrompt } from './identity';
 import type { AppendLog } from './resources';
 import type { ActiveShare } from './screen-state';
+import { renderCodebaseResource, type CodebaseInfo } from './codebase';
 import { ageOf, quantizeNow } from './time';
 import type { AssembledResult, AssembledToolCall, CerebrasClient } from './cerebras';
 
@@ -203,8 +204,29 @@ export function toDecision(call: AssembledToolCall | undefined): Decision {
 }
 
 /** Pick the decision from a completed brain result: bias to no_op, take the first tool call. */
-export function decisionFromResult(result: AssembledResult): Decision {
-  return toDecision(result.toolCalls[0]);
+export function decisionsFromResult(result: AssembledResult): Decision[] {
+  /**
+   * Take ALL the model's tool calls, not just the first — Gemma can emit several in one response (true
+   * parallel intent, e.g. fire three research agents at once). Each is validated through the no_op
+   * funnel; identical actions are de-duped so a repeated call can't double-fire. An empty/contentless
+   * result yields a single no_op (the safe yield). A one-call response is just a one-element batch, so
+   * the common case is byte-identical to before.
+   */
+  if (result.toolCalls.length === 0) return [toDecision(undefined)];
+  return dedupeDecisions(result.toolCalls.map(toDecision));
+}
+
+/** Collapse byte-identical decisions (same tool + JSON-stable args) so a repeated call fires once. */
+function dedupeDecisions(decisions: Decision[]): Decision[] {
+  const seen = new Set<string>();
+  const out: Decision[] = [];
+  for (const d of decisions) {
+    const key = `${d.name}:${JSON.stringify(d.args)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(d);
+  }
+  return out;
 }
 
 /**
@@ -313,7 +335,7 @@ export function renderMeetingResource(args: {
   const conversation = renderConversationResource(args.transcript, args.newSinceSeqNo, args.now);
   const screen = renderScreenResource(args.screen, args.now);
   return (
-    `<${M} now="${nowIso}"${elapsed}${quiet} note="the live meeting — what's being SAID (conversation) and SHOWN (screen); time is RELATIVE: an age like &quot;40s ago&quot; or &quot;just now&quot;, gaps under ~2s read as simultaneous">\n` +
+    `<${M} now="${nowIso}" tz="UTC"${elapsed}${quiet} note="the live meeting — what's being SAID (conversation) and SHOWN (screen). \`now\` is wall-clock UTC; participants may be in different time zones, so anchor to UTC and don't assume a local zone. Everything else is a RELATIVE age (&quot;40s ago&quot;, &quot;just now&quot;); gaps under ~2s read as simultaneous">\n` +
     `${conversation}\n${screen}\n` +
     `</${M}>`
   );
@@ -440,11 +462,15 @@ export function renderResources(args: {
   subAgents: LogEntry<SubAgentTaskRecord>[];
   /** The current shared-screen state (what's shown + since when). Omitted ⇒ nothing on screen. */
   screen?: ActiveShare | null;
+  /** The codebase the agent is embedded in (static per session). Omitted ⇒ no <codebase> block. */
+  codebase?: CodebaseInfo;
   /** This beat's authoritative clock (epoch ms). Defaults to now; injected for deterministic tests. */
   now?: number;
 }): string {
   const now = args.now ?? Date.now();
   return [
+    /** Framing first: the repo the agent is embedded in (so it knows it can research the real code). */
+    ...(args.codebase ? [renderCodebaseResource(args.codebase)] : []),
     renderMeetingResource({
       transcript: args.transcript,
       newSinceSeqNo: args.newSinceSeqNo,
@@ -462,7 +488,7 @@ export function renderResources(args: {
  * concrete meaning of "Gemma has nothing in band" — the user turn is a content-free trigger to act.
  */
 const HEARTBEAT_PULSE =
-  '[heartbeat] You have just observed the live state resources in your context. Think briefly first: in one sentence, what (if anything) genuinely needs you right now? Then choose exactly one action for this beat — speak, share_screen, call_agent, no_op, or sleep. Default HARD to no_op: only act on a clear, specific opening where you add value the room does not already have. Do not call_agent for anything you can answer directly, anything trivial, or any task already shown as running in <sub_agents>.';
+  '[heartbeat] You have just observed the live state resources in your context. Think briefly first: in one sentence, what (if anything) genuinely needs you right now? Then choose your action(s) for this beat from speak, share_screen, call_agent, no_op, or sleep — usually ONE, but you MAY fire SEVERAL at once when they are independent (e.g. dispatch several research agents in parallel in a single beat). Default HARD to no_op: only act on a clear, specific opening where you add value the room does not already have. Do not call_agent for anything you can answer directly, anything trivial, or any task already shown as running in <sub_agents>.';
 
 /**
  * Assemble the model input so observed state is NEVER in-band. Mirrors Shipyard's pattern (resources
@@ -482,6 +508,8 @@ export function buildResourceMessages(args: {
   subAgents: LogEntry<SubAgentTaskRecord>[];
   /** Current shared-screen state — the <screen> block inside <meeting>. Omitted ⇒ nothing shared. */
   screen?: ActiveShare | null;
+  /** The codebase the agent is embedded in — the <codebase> framing block. Omitted ⇒ no block. */
+  codebase?: CodebaseInfo;
   /** This beat's authoritative clock (epoch ms). Defaults to now; injected for deterministic tests. */
   now?: number;
 }): ChatCompletionMessageParam[] {
@@ -491,6 +519,7 @@ export function buildResourceMessages(args: {
     deliverables: args.deliverables,
     subAgents: args.subAgents,
     screen: args.screen ?? null,
+    codebase: args.codebase,
     now: args.now,
   });
   return [
@@ -540,6 +569,11 @@ export interface DecideDeps {
    */
   screen?: () => ActiveShare | null;
   /**
+   * The codebase the agent is embedded in (name + description + root). Static per session, injected as
+   * the <codebase> framing block so the brain knows its research agents can investigate this real repo.
+   */
+  codebase?: CodebaseInfo;
+  /**
    * Optional sink for live inference stats. Called after each `cerebras.complete` with the
    * assembled result's usage + wall-clock tok/s, so the wiring can broadcast it to the web HUD
    * (the rate is otherwise computed in cerebras.ts and discarded). Errors here are not propagated.
@@ -549,9 +583,10 @@ export interface DecideDeps {
 
 /**
  * Build a decide() the orchestrator can call with just the transcript delta. The brain client and
- * session context are injected here so the hot path stays `(delta) => Promise<Decision>`.
+ * session context are injected here so the hot path stays `(delta) => Promise<Decision[]>`. It returns
+ * a BATCH: the model may emit several tool calls in one beat (parallel fan-out); usually it's one.
  */
-export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry>[]) => Promise<Decision> {
+export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry>[]) => Promise<Decision[]> {
   const system = buildSystemPrompt(deps.context);
   return async (delta) => {
     /**
@@ -574,6 +609,7 @@ export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry
       deliverables: deps.deliverables.snapshot(),
       subAgents: deps.subAgents.snapshot(),
       screen: deps.screen?.() ?? null,
+      codebase: deps.codebase,
       now,
     });
     const result = await deps.cerebras.complete({
@@ -585,6 +621,6 @@ export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry
       promptTokens: result.usage?.promptTokens ?? 0,
       completionTokens: result.usage?.completionTokens ?? 0,
     });
-    return decisionFromResult(result);
+    return decisionsFromResult(result);
   };
 }

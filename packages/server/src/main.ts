@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { createResources } from './core/resources';
 import { createScreenState } from './core/screen-state';
+import { describeCodebase } from './core/codebase';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, foldLatestById, type Decision } from './core/decide';
 import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
@@ -328,6 +329,11 @@ async function main(): Promise<void> {
        * share_screen records here) — the SAME path the local web app and the Zoom bot both render through.
        */
       screen: () => screen.current(),
+      /**
+       * The codebase the agent is embedded in — rooted at CURSOR_AGENT_CWD (exactly where the research
+       * sub-agents run / ripgrep searches), so the brain knows the real repo its agents can investigate.
+       */
+      codebase: describeCodebase(CURSOR_AGENT_CWD),
       /** Live tok/s + token counts → the web HUD (otherwise computed in cerebras.ts and discarded). */
       onStats: (stats) => ws.broadcastStats(stats),
     });
