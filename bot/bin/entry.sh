@@ -12,7 +12,7 @@ mkdir -p out
 #   STAGE_URL    page the headed Chromium loads (the Mac-served web stage)
 #   DISPLAY      the Xvfb display Chromium draws on / the bot captures (:99)
 SHARE_MODE="${SHARE_MODE:-stage}"
-STAGE_URL="${STAGE_URL:-http://host.docker.internal:5173}"
+STAGE_URL="${STAGE_URL:-http://host.docker.internal:5173/?view=stage}"
 export DISPLAY="${DISPLAY:-:99}"
 
 CHROME_BIN="${CHROME_BIN:-google-chrome-stable}"

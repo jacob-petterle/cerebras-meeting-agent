@@ -188,6 +188,20 @@ h3 {
   overflow: hidden;
 }
 
+/* Stage-only mode (?view=stage): the deliverable surface fills the whole viewport — this is what the
+   Zoom bot's headless Chromium loads + screenshares, so participants see only the shared artifact. */
+.stage-only {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  background: var(--bg);
+}
+.stage-only .stage-pane {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
 /* ------------------------------------------------------- status + pills */
 
 .pill {

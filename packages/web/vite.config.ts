@@ -8,6 +8,8 @@ import { defineConfig } from 'vite';
  */
 export default defineConfig({
   plugins: [react()],
-  server: { port: 5173 },
+  // allowedHosts: the bot's headless Chromium loads the stage via http://host.docker.internal:5173,
+  // and Vite 5.4+ rejects non-localhost Host headers unless allowlisted. `true` = allow any (dev).
+  server: { port: 5173, allowedHosts: true },
   build: { target: 'es2022' },
 });

@@ -19,6 +19,18 @@ import { createAudioOutUplink } from './adapters/zoom/audioOutUplink';
 import { createDisplayShare } from './adapters/zoom/displayShare';
 import type { AudioInPort, AudioOutPort, DisplayPort, Ports } from './core/ports';
 
+// Load .env FIRST — before the env-derived consts below are read at module-load time. Doing this
+// inside main() (as it was) runs too late: ZOOM/BOT_OUT_DIR/BOT_TTS_PORT/EXCLUDE_NODE_ID would have
+// already read an empty process.env, so `.env` silently never set them (only the ambient shell did).
+for (const candidate of ['.env', fileURLToPath(new URL('../../../.env', import.meta.url))]) {
+  try {
+    process.loadEnvFile?.(candidate);
+    break;
+  } catch {
+    /* not at this path — try the next candidate (ambient env still applies) */
+  }
+}
+
 /**
  * Entrypoint — wires the transport-agnostic core to an adapter set:
  *   browser mic (WS pcm) → VAD → STT → raw buffer (corrected on the heartbeat) → transcript
@@ -44,6 +56,13 @@ const BOT_TTS_PORT = Number(process.env.BOT_TTS_PORT ?? 3001);
 const EXCLUDE_NODE_ID = process.env.EXCLUDE_NODE_ID || undefined;
 /** Verbose per-frame pipeline logging (high-frequency). Off by default; `DEBUG_PIPE=1` to enable. */
 const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
+/**
+ * Heartbeat FALLBACK interval (ms). The brain now also reacts event-driven — a new utterance pokes it
+ * to decide within ~a debounce — so this is just the idle cadence that catches non-speech events (e.g.
+ * a finished sub-agent's deliverable to share). Lower than the old 4000 for snappier idle pickup.
+ * Override with HEARTBEAT_MS (e.g. =1000 to experiment).
+ */
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 1500);
 /** Repo root (…/cerebras-hackathon-prep), three up from packages/server/src/main.ts. */
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 /**
@@ -103,18 +122,7 @@ process.on('uncaughtException', (err) => {
 });
 
 async function main(): Promise<void> {
-  // Load env (Node >= 20.12 / 22). `pnpm dev` runs with cwd=packages/server (pnpm --filter), so the
-  // repo-root .env is NOT at cwd — try cwd first, then the repo-root .env resolved relative to this
-  // module (../../../ from packages/server/src/main.ts). First file that loads wins; absent is fine.
-  for (const candidate of ['.env', fileURLToPath(new URL('../../../.env', import.meta.url))]) {
-    try {
-      process.loadEnvFile?.(candidate);
-      break;
-    } catch {
-      /* not at this path — try the next candidate (ambient env still applies) */
-    }
-  }
-
+  // .env was already loaded at module top (see above) so the env-derived consts picked it up.
   const apiKey = process.env.CEREBRAS_API_KEY ?? '';
   /** With a brain (key present) STT is buffered + corrected on the heartbeat; without one it streams raw. */
   const brainEnabled = apiKey.length > 0;
@@ -195,6 +203,22 @@ async function main(): Promise<void> {
     }
     vad.pushFrame(frame);
   });
+  /**
+   * Event-driven heartbeat. After a new utterance is buffered, nudge the brain to decide ~promptly
+   * (debounced so a multi-utterance turn collapses into a single beat) rather than waiting for the
+   * fixed fallback interval. `poke()` is a no-op while a beat is already in flight.
+   */
+  let pokeTimer: ReturnType<typeof setTimeout> | null = null;
+  const POKE_DEBOUNCE_MS = 350;
+  const pokeSoon = (): void => {
+    if (pokeTimer) clearTimeout(pokeTimer);
+    pokeTimer = setTimeout(() => {
+      pokeTimer = null;
+      orchestratorRef?.poke();
+    }, POKE_DEBOUNCE_MS);
+    if (pokeTimer && typeof pokeTimer.unref === 'function') pokeTimer.unref();
+  };
+
   vad.onUtterance((u) => {
     // The VAD invokes this un-awaited (fire-and-forget per participant), so a throw here would become
     // an UNHANDLED REJECTION that takes the whole process down (exit 1) mid-session — the crash that
@@ -211,6 +235,7 @@ async function main(): Promise<void> {
          * and the brain only ever observes corrected text.
          */
         rawBuffer.push({ participantId: u.participantId, text, timestamp: u.ts });
+        pokeSoon(); // VAD-driven: react ~promptly after the speaker pauses, not on the fixed interval.
       } else {
         /**
          * No brain (no key) → no corrector. Stream the raw line straight to the transcript so the web
@@ -370,6 +395,8 @@ async function main(): Promise<void> {
       onDecision: (decision) =>
         ws.broadcastDecision({ name: decision.name, detail: summarizeDecision(decision), ts: Date.now() }),
       scheduler: intervalScheduler(),
+      /** Idle/fallback cadence; the event-driven poke() (on new utterances) drives responsiveness. */
+      intervalMs: HEARTBEAT_MS,
     });
     orchestratorRef = orchestrator;
     stopHeartbeat = orchestrator.start();

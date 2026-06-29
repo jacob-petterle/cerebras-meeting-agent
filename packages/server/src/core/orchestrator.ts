@@ -79,6 +79,12 @@ export interface Orchestrator {
    * completion can't advance the cursor past a span that no longer exists (the logs were just wiped).
    */
   reset(): void;
+  /**
+   * Run a beat NOW if idle — an event-driven trigger (e.g. fired right after a new utterance lands) so
+   * the brain reacts within ~a debounce of someone finishing a sentence instead of waiting up to a full
+   * interval. A no-op if a beat is already in flight (the busy lock), so it can be called freely.
+   */
+  poke(): void;
 }
 
 const HEARTBEAT_MS = 4000;
@@ -223,6 +229,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
        */
       generation += 1;
       cursor = -1;
+    },
+    poke() {
+      /** tick() already guards on the busy lock + empty delta, so an extra call is always safe. */
+      void tick();
     },
   };
 }
