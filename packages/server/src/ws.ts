@@ -72,6 +72,12 @@ export interface WsServerHandle {
   broadcastDecision(decision: { name: string; detail: string; ts: number }): void;
   /** Push the live "thinking" pulse (brain mid-decide) to the agent-state visualizer. */
   broadcastAgentState(thinking: boolean): void;
+  /**
+   * Tell every client to clear its view (after a SERVER-INITIATED reset — e.g. a spoken voice command
+   * the pipeline recognized). The inbound `reset` MESSAGE path already broadcasts on its own; this is
+   * the seam for resets that don't originate from a client frame. Server-state wipe is the caller's job.
+   */
+  broadcastReset(): void;
   close(): Promise<void>;
 }
 
@@ -116,6 +122,11 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
    * listen takes over); on its disconnect we promote the most-recently-connected survivor.
    */
   let audioSink: WebSocket | null = null;
+
+  /** Tell every connected client to clear its view. The single client-broadcast point for a reset. */
+  function broadcastReset(): void {
+    for (const client of clients) send(client, { type: 'reset' });
+  }
 
   const whenReady = new Promise<number>((resolve, reject) => {
     wss.once('listening', () => {
@@ -187,7 +198,7 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
         case 'reset': {
           /** Wipe server-side state, then tell every client to clear its view. */
           deps.onReset?.();
-          for (const client of clients) send(client, { type: 'reset' });
+          broadcastReset();
           return;
         }
       }
@@ -239,6 +250,7 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
         send(ws, { type: 'agent_state', thinking });
       }
     },
+    broadcastReset,
     close(): Promise<void> {
       /**
        * `terminate()` (not `close()`): a graceful close handshake races the `wss.close()` below —

@@ -6,6 +6,7 @@ import { createScreenState } from './core/screen-state';
 import { describeCodebase } from './core/codebase';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, foldLatestById, type Decision } from './core/decide';
+import { isResetCommand } from './core/reset-phrase';
 import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
 import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
@@ -191,7 +192,16 @@ async function main(): Promise<void> {
   let stopTransport: (() => void) | null = null;
   /** Set once the brain is enabled; the reset handler rewinds its cursor when a client clears the session. */
   let orchestratorRef: Orchestrator | null = null;
+  /**
+   * Session epoch — bumped on EVERY reset (web button, WS message, or voice command). The utterance
+   * handler captures it BEFORE the async STT and re-checks it after: speech whose audio predates a reset
+   * that fired while we were transcribing belongs to the OLD session, so we drop it instead of letting it
+   * re-dirty the just-cleared transcript. Without this, a sentence in flight at reset-time lands as the
+   * first line of the "fresh" session — which makes a demo reset look like it didn't fully clear.
+   */
+  let resetEpoch = 0;
   const onReset = (): void => {
+    resetEpoch += 1;
     resources.transcript.reset();
     resources.deliverables.reset();
     resources.subAgents.reset();
@@ -275,10 +285,29 @@ async function main(): Promise<void> {
     // an UNHANDLED REJECTION that takes the whole process down (exit 1) mid-session — the crash that
     // killed a live mic test. Own the rejection: log and drop this one utterance, never propagate.
     void (async () => {
+      // Capture the session epoch BEFORE the async STT. A reset() during transcription bumps it; an
+      // utterance whose audio predates that reset must not land in the fresh session (see resetEpoch).
+      const epoch = resetEpoch;
       console.log(`[pipe] VAD→utterance ${u.pcm.length}smp @${u.sampleRate}Hz`);
       const text = (await stt.transcribe(u.pcm, u.sampleRate)).trim();
       console.log(`[pipe] STT→ "${text}"`);
       if (!text) return;
+      // Stale-after-reset guard: a reset fired while we were transcribing — this speech belongs to the
+      // old session. Drop it rather than re-dirtying the just-cleared transcript.
+      if (epoch !== resetEpoch) {
+        console.log('[pipe] utterance dropped — session was reset mid-transcription');
+        return;
+      }
+      // Voice-command reset: a spoken phrase ("Atlas, let's start fresh") clears the live context in
+      // ONE action, no operator-console click — the demo-friendly trigger. Deterministic phrase match
+      // (NOT a brain tool), so it fires reliably every take and never depends on Gemma. The command
+      // utterance itself is the trigger, so we wipe + tell clients to clear and DON'T append it.
+      if (isResetCommand(text)) {
+        console.log(`[pipe] voice reset command recognized: "${text}"`);
+        onReset();
+        ws.broadcastReset();
+        return;
+      }
       // Raw STT goes STRAIGHT to the transcript — no corrector / second LLM pass. The brain decides
       // on the raw Moonshine text directly.
       resources.transcript.append({
