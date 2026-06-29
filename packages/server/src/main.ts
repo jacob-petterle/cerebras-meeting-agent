@@ -363,6 +363,8 @@ async function main(): Promise<void> {
       /** Surface EVERY decision (incl. no_op) to the console's decision feed — UI-only, not the transcript. */
       onDecision: (decision) =>
         ws.broadcastDecision({ name: decision.name, detail: summarizeDecision(decision), ts: Date.now() }),
+      /** Drive the agent-state visualizer's "thinking" animation while the brain is mid-decide. */
+      onThinkingChange: (thinking) => ws.broadcastAgentState(thinking),
       scheduler: intervalScheduler(),
       /** Idle/fallback cadence; the event-driven poke() (on new utterances) drives responsiveness. */
       intervalMs: HEARTBEAT_MS,

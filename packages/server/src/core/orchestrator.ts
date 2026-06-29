@@ -55,6 +55,12 @@ export interface OrchestratorDeps {
    * the wiring broadcasts it to the console so a heartbeat that chose silence is still visible.
    */
   onDecision?: (decision: Decision) => void;
+  /**
+   * The brain's "thinking" pulse: `true` right before the (network) `decide` call, `false` when it
+   * resolves or errors. UI-only — the wiring broadcasts it so the agent-state visualizer can show a
+   * thinking animation while the brain is mid-decide. Bounded strictly to the decide() await.
+   */
+  onThinkingChange?: (thinking: boolean) => void;
   /** Heartbeat period; defaults to 4s. Tests inject a manual scheduler and ignore this. */
   intervalMs?: number;
 }
@@ -116,14 +122,17 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
      * fall through to the no-op path: advance, release, return.
      */
     let decision: Decision;
+    deps.onThinkingChange?.(true);
     try {
       decision = await decide(delta);
     } catch (err) {
       console.error('[orchestrator] decide failed:', err);
+      deps.onThinkingChange?.(false);
       if (gen === generation) cursor = claimedHead;
       busy = false;
       return;
     }
+    deps.onThinkingChange?.(false);
 
     /** Report EVERY decision (incl. no_op) for the console. UI-only — never written to the transcript. */
     deps.onDecision?.(decision);

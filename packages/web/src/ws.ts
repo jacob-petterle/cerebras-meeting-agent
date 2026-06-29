@@ -107,6 +107,9 @@ function dispatch(message: Incoming): void {
     case 'decision':
       store.appendDecision({ name: message.name, detail: message.detail, ts: message.ts });
       break;
+    case 'agent_state':
+      store.setThinking(message.thinking);
+      break;
     case 'reset':
       store.resetAll();
       break;

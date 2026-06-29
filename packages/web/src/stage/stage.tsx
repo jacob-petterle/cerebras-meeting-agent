@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import { IconMonitor } from '../lib/icons';
 import { assertNever } from '../lib/assert-never';
 import { useHarnessStore } from '../store';
+import { AgentOrb } from './agent-orb';
 import { Sandbox } from './sandbox';
 
 /**
@@ -128,31 +129,31 @@ function StageContent({ cmd }: { cmd: RenderCommand }): ReactNode {
   }
 }
 
-function StageEmpty() {
-  return (
-    <div className="empty">
-      <IconMonitor size={26} className="glyph" />
-      <span className="t">Nothing shared yet</span>
-      <span className="h">share_screen renders here</span>
-    </div>
-  );
-}
-
-export function Stage() {
+/**
+ * The Stage. `minimal` is the screenshare/presence surface: no header — when nothing is shared it's
+ * JUST the agent-state aurora, full-bleed; when a deliverable IS shared the artifact fills the stage
+ * and the aurora shrinks to a PIP corner. The non-minimal variant (the operator console) keeps the
+ * little header bar above the same body.
+ */
+export function Stage({ minimal = false }: { minimal?: boolean }) {
   const render = useHarnessStore((state) => state.render);
   const renderCount = useHarnessStore((state) => state.renderCount);
 
   return (
-    <section className="stage-pane" aria-label="Stage">
-      <div className="stage-head">
-        <IconMonitor size={15} aria-hidden="true" style={{ color: 'var(--faint)' }} />
-        <span className="eyebrow">Stage</span>
-        <span className="title">{render?.title ?? (render ? 'Shared artifact' : 'Idle')}</span>
-        {render ? <span className="kindtag">{render.kind}</span> : null}
-      </div>
+    <section className={minimal ? 'stage-pane minimal' : 'stage-pane'} aria-label="Stage">
+      {minimal ? null : (
+        <div className="stage-head">
+          <IconMonitor size={15} aria-hidden="true" style={{ color: 'var(--faint)' }} />
+          <span className="eyebrow">Stage</span>
+          <span className="title">{render?.title ?? (render ? 'Shared artifact' : 'Idle')}</span>
+          {render ? <span className="kindtag">{render.kind}</span> : null}
+        </div>
+      )}
       <div className="stage-body">
-        {render ? <StageContent key={renderCount} cmd={render} /> : <StageEmpty />}
+        {render ? <StageContent key={renderCount} cmd={render} /> : <AgentOrb />}
       </div>
+      {/* PIP lives outside the scroll body so it stays pinned to the corner regardless of deliverable scroll. */}
+      {render ? <AgentOrb pip /> : null}
     </section>
   );
 }

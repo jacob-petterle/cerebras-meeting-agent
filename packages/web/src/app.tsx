@@ -132,12 +132,13 @@ function resolveStageOnly(): boolean {
 }
 
 export function App() {
-  // Default render is the deliverable-only stage (screenshare-friendly). The full operator console is
-  // debug-gated — see resolveStageOnly. `?view=stage` is kept as an explicit force for the Zoom bot.
+  // Default render is the screenshare surface (no chrome): just the agent-state aurora when nothing is
+  // shared, the deliverable + an aurora PIP when it is. The full operator console is debug-gated — see
+  // resolveStageOnly. `?view=stage` is kept as an explicit force for the Zoom bot.
   if (resolveStageOnly()) {
     return (
       <div className="stage-only">
-        <Stage />
+        <Stage minimal />
       </div>
     );
   }

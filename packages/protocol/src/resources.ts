@@ -97,5 +97,11 @@ export type ServerMsg =
   | { type: 'stats'; tokensPerSec: number | null; promptTokens: number; completionTokens: number }
   /** Every heartbeat decision (incl. no_op) for the observability console. UI-only — never the transcript. */
   | { type: 'decision'; name: string; detail: string; ts: number }
+  /**
+   * Live "thinking" pulse — the brain is mid-decide (a network call to Gemma). Drives the agent-state
+   * visualizer's thinking animation. UI-only; the other states (listening/speaking/researching) the web
+   * derives from existing signals (mic, play frames, the subAgents log).
+   */
+  | { type: 'agent_state'; thinking: boolean }
   /** Broadcast after a `reset` so every client clears its view. */
   | { type: 'reset' };

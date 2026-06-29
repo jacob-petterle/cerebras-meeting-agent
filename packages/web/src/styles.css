@@ -187,6 +187,10 @@ h3 {
   flex-direction: column;
   overflow: hidden;
 }
+/* Positioned so the agent-orb PIP (a sibling of the scroll body) anchors to the pane corner. */
+.stage-pane {
+  position: relative;
+}
 
 /* Stage-only mode (?view=stage): the deliverable surface fills the whole viewport — this is what the
    Zoom bot's headless Chromium loads + screenshares, so participants see only the shared artifact. */
@@ -716,6 +720,66 @@ h3 {
   overflow: auto;
   background: var(--bg);
   position: relative;
+}
+
+/* ---------------------------------------------------- agent-state orb (Aura) */
+
+/* Full-bleed presence: the aurora fills the stage, centered as a square, when nothing is shared. */
+.agent-orb {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.agent-orb .aura-box {
+  aspect-ratio: 1 / 1;
+  height: clamp(160px, 36vmin, 340px);
+  max-width: 84%;
+}
+.agent-orb .agent-orb-label {
+  position: absolute;
+  bottom: 7%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--faint);
+  transition: color 300ms ease;
+}
+.agent-orb[data-state='listening'] .agent-orb-label,
+.agent-orb[data-state='speaking'] .agent-orb-label {
+  color: var(--accent);
+}
+.agent-orb[data-state='thinking'] .agent-orb-label {
+  color: var(--tool);
+}
+
+/* PIP: a small corner card when a deliverable is on the stage. Anchored to the pane, not the scroller. */
+.agent-orb.pip {
+  inset: auto;
+  right: 14px;
+  bottom: 14px;
+  width: 132px;
+  height: 132px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+  z-index: 5;
+}
+.agent-orb.pip .aura-box {
+  height: 92px;
+  max-width: 92px;
+}
+.agent-orb.pip .agent-orb-label {
+  bottom: 7px;
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
 }
 .stage-frame {
   border: 0;

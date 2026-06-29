@@ -92,6 +92,8 @@ interface HarnessState {
   lastPlayAt: number | null;
   stats: ServerStats | null;
   decisions: DecisionEvent[];
+  /** The brain is mid-decide (server `agent_state` pulse). Drives the visualizer's thinking state. */
+  thinking: boolean;
 
   micOn: boolean;
   micLevel: number;
@@ -114,6 +116,7 @@ interface HarnessState {
   notePlay: () => void;
   setStats: (stats: ServerStats) => void;
   appendDecision: (d: DecisionEvent) => void;
+  setThinking: (thinking: boolean) => void;
   /** Clear all session feeds + stage (after a server reset). hwm → -1 so a fresh seqNo 0 is accepted. */
   resetAll: () => void;
 
@@ -136,6 +139,7 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
   lastPlayAt: null,
   stats: null,
   decisions: [],
+  thinking: false,
 
   micOn: false,
   micLevel: 0,
@@ -215,6 +219,8 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
 
   appendDecision: (d) => set((prev) => ({ decisions: [...prev.decisions, d].slice(-MAX_DECISIONS) })),
 
+  setThinking: (thinking) => set({ thinking }),
+
   resetAll: () =>
     set({
       transcript: [],
@@ -223,6 +229,7 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
       hwm: { transcript: -1, deliverables: -1, subAgents: -1 },
       render: null,
       decisions: [],
+      thinking: false,
     }),
 
   setMicOn: (on) => set({ micOn: on, micLevel: 0 }),

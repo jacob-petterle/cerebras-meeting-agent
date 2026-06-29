@@ -88,6 +88,7 @@ export type Incoming =
   | { type: 'play'; sampleRate: number; pcm: number[] }
   | { type: 'stats'; stats: ServerStats }
   | { type: 'decision'; name: string; detail: string; ts: number }
+  | { type: 'agent_state'; thinking: boolean }
   | { type: 'reset' };
 
 function parseResource(value: unknown): ResourceName | null {
@@ -172,6 +173,8 @@ export function parseServerMessage(raw: unknown): Incoming | null {
       const r = zDecision.safeParse(json);
       return r.success ? { type: 'decision', name: r.data.name, detail: r.data.detail, ts: r.data.ts } : null;
     }
+    case 'agent_state':
+      return typeof json.thinking === 'boolean' ? { type: 'agent_state', thinking: json.thinking } : null;
     case 'reset':
       return { type: 'reset' };
     default:

@@ -70,6 +70,8 @@ export interface WsServerHandle {
   }): void;
   /** Push a brain decision (incl. no_op) to the console's decision feed. */
   broadcastDecision(decision: { name: string; detail: string; ts: number }): void;
+  /** Push the live "thinking" pulse (brain mid-decide) to the agent-state visualizer. */
+  broadcastAgentState(thinking: boolean): void;
   close(): Promise<void>;
 }
 
@@ -212,6 +214,11 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
     broadcastDecision(decision): void {
       for (const ws of clients) {
         send(ws, { type: 'decision', name: decision.name, detail: decision.detail, ts: decision.ts });
+      }
+    },
+    broadcastAgentState(thinking): void {
+      for (const ws of clients) {
+        send(ws, { type: 'agent_state', thinking });
       }
     },
     close(): Promise<void> {
