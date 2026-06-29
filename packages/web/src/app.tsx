@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Console } from './console/console';
-import { IconActivity, IconMic, IconMicOff, IconOffline } from './lib/icons';
+import { IconActivity, IconMic, IconMicOff, IconOffline, IconReset } from './lib/icons';
 import { formatUptime } from './lib/format';
 import { startMic, stopMic } from './mic';
 import { Stage } from './stage/stage';
 import { useHarnessStore } from './store';
-import { resolveWsUrl } from './ws';
+import { resolveWsUrl, sendReset } from './ws';
 
 function ConnectionPill() {
   const connection = useHarnessStore((state) => state.connection);
@@ -77,6 +77,21 @@ function MicControl() {
   );
 }
 
+function ResetButton() {
+  return (
+    <button
+      type="button"
+      className="mic-btn"
+      onClick={() => sendReset()}
+      aria-label="Reset session"
+      title="Clear the transcript, deliverables, decisions, and stage (keeps the models warm)"
+    >
+      <IconReset className="mic-glyph" />
+      <span>Reset</span>
+    </button>
+  );
+}
+
 function OfflineBanner() {
   const connection = useHarnessStore((state) => state.connection);
   if (connection === 'open') return null;
@@ -105,6 +120,7 @@ export function App() {
         </div>
         <ConnectionPill />
         <MicControl />
+        <ResetButton />
       </header>
       <OfflineBanner />
       <main className="main">

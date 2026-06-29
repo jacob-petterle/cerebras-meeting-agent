@@ -55,6 +55,11 @@ export function fetchOlder(resource: ResourceName, beforeSeqNo: number, limit: n
   send({ type: 'fetch_older', resource, beforeSeqNo, limit });
 }
 
+/** Clear the session: the server wipes its logs + brain cursor, then broadcasts a reset to all clients. */
+export function sendReset(): void {
+  send({ type: 'reset' });
+}
+
 function subscribeAll(): void {
   /**
    * On the first connect hwm is -1, so this requests the full history. On a
@@ -90,6 +95,12 @@ function dispatch(message: Incoming): void {
       break;
     case 'stats':
       store.setStats(message.stats);
+      break;
+    case 'decision':
+      store.appendDecision({ name: message.name, detail: message.detail, ts: message.ts });
+      break;
+    case 'reset':
+      store.resetAll();
       break;
     default:
       assertNever(message);
