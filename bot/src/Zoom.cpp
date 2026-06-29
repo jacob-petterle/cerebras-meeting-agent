@@ -467,6 +467,19 @@ SDKError Zoom::startScreenShare() {
         }
     }
 
+    // Tell Zoom to encode this share as FULL-MOTION VIDEO, not static content. Without
+    // it Zoom uses the screen-content codec (optimized for crisp static text at low fps),
+    // which makes our animated orb look blocky/low-bitrate. This switches to the video
+    // path (higher framerate/bitrate for motion). Applied when the share starts.
+    if (shareCtl->IsSupportEnableOptimizeForFullScreenVideoClip()) {
+        auto optErr = shareCtl->EnableOptimizeForFullScreenVideoClip(true);
+        Log::info(optErr == SDKERR_SUCCESS
+                      ? "share settings: optimize-for-video-clip enabled"
+                      : "share settings: optimize-for-video-clip request returned " + std::to_string(optErr));
+    } else {
+        Log::info("share settings: optimize-for-video-clip not supported in this meeting");
+    }
+
     if (!m_shareSource)
         m_shareSource = new ZoomSDKShareSource();
 
