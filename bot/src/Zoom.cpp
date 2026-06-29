@@ -455,6 +455,18 @@ SDKError Zoom::startScreenShare() {
         return SDKERR_UNINITIALIZE;
     }
 
+    // Lift Zoom's built-in "limited sharing FPS" throttle. The stage is full-motion
+    // (the animated aura orb), but Zoom defaults to a content-share cap that makes it
+    // choppy/low-bitrate. Disable the cap (and raise the max value as belt-and-suspenders
+    // in case the account forces the limit on) so our high-fps producer isn't throttled.
+    if (m_settingService) {
+        if (auto* shareSettings = m_settingService->GetShareSettings()) {
+            shareSettings->EnableLimitFPSWhenShare(false);
+            shareSettings->SetLimitFPSValueWhenShare(limitfps_15_frame);
+            Log::info("share settings: limited-FPS throttle disabled");
+        }
+    }
+
     if (!m_shareSource)
         m_shareSource = new ZoomSDKShareSource();
 
