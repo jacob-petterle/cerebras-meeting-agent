@@ -109,14 +109,32 @@ function OfflineBanner() {
   );
 }
 
+/**
+ * Decide whether to render the deliverable-only stage (the DEFAULT — what a screenshare should show)
+ * or the full operator console (header, mic, console tabs, HUD). Precedence:
+ *   - `?view=stage`     → always stage-only (the Zoom bot loads this, so its share is clean regardless)
+ *   - `?view=full` / `?debug` → always the full console (ad-hoc override)
+ *   - otherwise         → follow the build-time debug flag VITE_DEBUG_UI, defaulting to stage-only.
+ * So the full web app appears ONLY when launched with the debug flag (`VITE_DEBUG_UI=1`, e.g.
+ * `pnpm web:debug`) or an explicit `?debug` URL; everything else is the deliverable alone.
+ */
+function resolveStageOnly(): boolean {
+  if (typeof window === 'undefined') return true;
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get('view');
+  if (view === 'stage') return true;
+  if (view === 'full') return false;
+  const debugParam = params.has('debug') && !['0', 'false'].includes(params.get('debug') ?? '');
+  if (debugParam) return false;
+  const env = import.meta.env.VITE_DEBUG_UI;
+  const debugEnv = env === '1' || env === 'true';
+  return !debugEnv;
+}
+
 export function App() {
-  // Stage-only mode: `?view=stage` renders JUST the deliverable surface, full-viewport, with no
-  // header/console/HUD. The Zoom bot's headless Chromium loads this URL so the screenshare shows
-  // only the shared artifact — not the whole operator console.
-  const stageOnly =
-    typeof window !== 'undefined' &&
-    new URLSearchParams(window.location.search).get('view') === 'stage';
-  if (stageOnly) {
+  // Default render is the deliverable-only stage (screenshare-friendly). The full operator console is
+  // debug-gated — see resolveStageOnly. `?view=stage` is kept as an explicit force for the Zoom bot.
+  if (resolveStageOnly()) {
     return (
       <div className="stage-only">
         <Stage />
