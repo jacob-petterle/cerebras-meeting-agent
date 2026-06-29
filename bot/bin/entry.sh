@@ -52,8 +52,9 @@ setup-pulseaudio() {
 # Start the virtual X server the stage Chromium draws on and the bot captures.
 # Xvfb has no "ready" signal, so poll xdpyinfo until the display answers.
 start-xvfb() {
-  echo "starting Xvfb on $DISPLAY (1280x720x24)"
-  Xvfb "$DISPLAY" -screen 0 1280x720x24 -ac -nolisten tcp &> out/xvfb.log &
+  # 16-bit colour halves framebuffer bandwidth vs 24-bit; 1280x720 kept for Zoom share resolution.
+  echo "starting Xvfb on $DISPLAY (1280x720x16)"
+  Xvfb "$DISPLAY" -screen 0 1280x720x16 -ac -nolisten tcp &> out/xvfb.log &
 
   for i in {1..50}; do
     if xdpyinfo -display "$DISPLAY" &> /dev/null; then
@@ -69,16 +70,16 @@ start-xvfb() {
 
 # Launch headed (NOT --headless) Chromium in kiosk mode on the Xvfb display so
 # the page actually renders into the framebuffer we capture. --disable-gpu is
-# deliberate: the stage is 2D, and it sidesteps the documented Chromium GPU
-# process death under Rosetta on Apple Silicon. BUT --disable-gpu also turns
-# WebGL OFF (getContext('webgl') returns null), which blanks the agent-state
-# aura orb (a WebGL shader) while the rest of the page renders. --enable-unsafe-
-# swiftshader restores WebGL via the software (SwiftShader/ANGLE) path — verified
-# in-container: without it WebGL=NULL, with it WebGL=OK. "unsafe" only means
-# software-rendered (no GPU sandbox guarantees), which is fine for our own stage.
+# deliberate: sidesteps the Chromium GPU-process death under Rosetta on Apple Silicon.
+# --enable-unsafe-swiftshader restores WebGL via the software (SwiftShader/ANGLE) path
+# so WEBGL_debug_renderer_info is available — agent-orb.tsx detects "SwiftShader" and
+# uses the zero-CPU CSS orb instead of the fragment shader, keeping load low. "unsafe"
+# means software-rendered only (no GPU sandbox), not a security concern for our stage.
+# --fps-cap=15 limits Blink's compositor to 15 fps — enough for this mostly-static
+# stage, cuts the SwiftShader budget ~50% vs the default 60 fps.
 start-chromium() {
   local url="${1:-$STAGE_URL}"
-  echo "launching Chromium (kiosk) on $DISPLAY -> $url"
+  echo "launching Chromium (kiosk, 15fps cap) on $DISPLAY -> $url"
   "$CHROME_BIN" \
     --kiosk \
     --no-sandbox \
@@ -88,6 +89,7 @@ start-chromium() {
     --window-size=1280,720 \
     --window-position=0,0 \
     --force-device-scale-factor=1 \
+    --fps-cap=15 \
     --no-first-run \
     --noerrdialogs \
     --disable-infobars \

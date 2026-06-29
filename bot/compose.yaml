@@ -2,6 +2,9 @@ services:
   zoomsdk: &zoomsdk
     build: ./
     platform: linux/amd64
+    # Guard against runaway CPU from the WebGL orb in software-GL mode; the CSS fallback
+    # handles SwiftShader automatically, but cap as insurance so the host stays responsive.
+    cpus: 4.0
     # Portable host.docker.internal: works on Docker Desktop for Mac for free,
     # and this makes the same hostname resolve on plain Linux Docker too. The
     # container Chromium loads the stage page from the Mac via this name.
