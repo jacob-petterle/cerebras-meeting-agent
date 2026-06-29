@@ -106,6 +106,27 @@ describe('parseServerMessage — valid frames per type', () => {
     expect(out?.type).toBe('stats');
     if (out?.type === 'stats') expect(out.stats.tokensPerSec).toBeNull();
   });
+
+  it('parses a decision frame (incl. no_op)', () => {
+    const out = parseServerMessage(
+      frame({ type: 'decision', name: 'no_op', detail: 'staying silent', ts: 5 }),
+    );
+    expect(out?.type).toBe('decision');
+    if (out?.type === 'decision') {
+      expect(out.name).toBe('no_op');
+      expect(out.detail).toBe('staying silent');
+      expect(out.ts).toBe(5);
+    }
+  });
+
+  it('rejects a decision frame missing required fields', () => {
+    expect(parseServerMessage(frame({ type: 'decision', name: 'speak' }))).toBeNull();
+  });
+
+  it('parses a reset frame', () => {
+    const out = parseServerMessage(frame({ type: 'reset' }));
+    expect(out?.type).toBe('reset');
+  });
 });
 
 describe('parseServerMessage — rejections', () => {

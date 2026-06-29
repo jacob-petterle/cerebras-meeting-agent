@@ -1,8 +1,9 @@
 import { fileURLToPath } from 'node:url';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
-import { createDecide } from './core/decide';
-import { createOrchestrator, intervalScheduler } from './core/orchestrator';
+import { createDecide, type Decision } from './core/decide';
+import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
+import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
 import { createCallAgentMock } from './core/tools/callAgent/mock';
 import { createVad, createStt, createTts } from './media';
@@ -44,6 +45,29 @@ const SESSION_CONTEXT =
   process.env.SESSION_CONTEXT ??
   'A local test session. One human participant ("me") is speaking into a microphone. No specific project is in scope yet — be a generally helpful collaborator.';
 
+/** Read a string field off a parsed (but `unknown`-typed) tool-args object without an assertion. */
+function argField(args: unknown, key: string): string {
+  if (!isRecord(args)) return '';
+  const value = args[key];
+  return typeof value === 'string' ? value : '';
+}
+
+/** A short, human-readable description of a decision for the console feed (incl. no_op's reason). */
+function summarizeDecision(d: Decision): string {
+  switch (d.name) {
+    case 'no_op':
+      return argField(d.args, 'reason') || '(staying silent)';
+    case 'speak':
+      return argField(d.args, 'text');
+    case 'share_screen':
+      return argField(d.args, 'title') || argField(d.args, 'kind') || 'artifact';
+    case 'call_agent':
+      return argField(d.args, 'task');
+    default:
+      return '';
+  }
+}
+
 async function main(): Promise<void> {
   // Load env (Node >= 20.12 / 22). `pnpm dev` runs with cwd=packages/server (pnpm --filter), so the
   // repo-root .env is NOT at cwd — try cwd first, then the repo-root .env resolved relative to this
@@ -69,19 +93,27 @@ async function main(): Promise<void> {
 
   // Transport: pick the adapter set, then stand up the WS server (always — it serves the stage + HUD
   // in both modes). In LOCAL mode the WS inbound `pcm` hook feeds the pipeline; in ZOOM mode audio
-  // comes from the file-tailer instead, so we leave the WS mic hook unwired.
+  // comes from the file-tailer instead, so we leave the WS mic hook unwired. The Reset hook (web
+  // Reset button) clears the session + rewinds the brain in both modes.
   let audioIn: AudioInPort;
   let audioOut: AudioOutPort;
   let display: DisplayPort;
   let ws: WsServerHandle;
   /** ZOOM-only teardown (stop the tailer poll loop + close the uplink socket). */
   let stopTransport: (() => void) | null = null;
+  /** Set once the brain is enabled; the reset handler rewinds its cursor when a client clears the session. */
+  let orchestratorRef: Orchestrator | null = null;
+  const onReset = (): void => {
+    resources.transcript.reset();
+    resources.deliverables.reset();
+    orchestratorRef?.reset();
+  };
 
   if (ZOOM) {
     const bridge = createAudioInBridge({ outDir: BOT_OUT_DIR, excludeNodeId: EXCLUDE_NODE_ID });
     const uplink = createAudioOutUplink({ port: BOT_TTS_PORT });
     // WS server runs with NO mic hook — stage + HUD only; audio comes from the file-tailer.
-    ws = createWsServer({ resources, port: PORT });
+    ws = createWsServer({ resources, onReset, port: PORT });
     audioIn = bridge;
     audioOut = uplink;
     display = createDisplayShare(ws);
@@ -96,7 +128,7 @@ async function main(): Promise<void> {
     );
   } else {
     const localIn = createAudioInWs();
-    ws = createWsServer({ resources, onPcm: localIn.deliver, port: PORT });
+    ws = createWsServer({ resources, onPcm: localIn.deliver, onReset, port: PORT });
     audioIn = localIn.port;
     audioOut = createAudioOutWs(ws);
     display = createDisplayWs(ws);
@@ -176,8 +208,12 @@ async function main(): Promise<void> {
           timestamp: Date.now(),
         });
       },
+      /** Surface EVERY decision (incl. no_op) to the console's decision feed — UI-only, not the transcript. */
+      onDecision: (decision) =>
+        ws.broadcastDecision({ name: decision.name, detail: summarizeDecision(decision), ts: Date.now() }),
       scheduler: intervalScheduler(),
     });
+    orchestratorRef = orchestrator;
     stopHeartbeat = orchestrator.start();
     console.log('[main] brain enabled (Gemma on Cerebras). Start the web app (pnpm web) and talk.');
   } else {

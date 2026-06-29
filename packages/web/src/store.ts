@@ -23,6 +23,15 @@ import type { ServerStats } from './validate';
 
 export type ConnState = 'connecting' | 'open' | 'closed';
 
+/** One heartbeat decision for the console feed (incl. no_op). UI-only — not a resource. */
+export interface DecisionEvent {
+  name: string;
+  detail: string;
+  ts: number;
+}
+/** Cap the in-memory decision feed so a long session can't grow it without bound. */
+const MAX_DECISIONS = 200;
+
 interface Merge<T> {
   entries: LogEntry<T>[];
   hwm: number;
@@ -75,6 +84,7 @@ interface HarnessState {
   playCount: number;
   lastPlayAt: number | null;
   stats: ServerStats | null;
+  decisions: DecisionEvent[];
 
   micOn: boolean;
   micLevel: number;
@@ -92,6 +102,9 @@ interface HarnessState {
   setRender: (cmd: RenderCommand) => void;
   notePlay: () => void;
   setStats: (stats: ServerStats) => void;
+  appendDecision: (d: DecisionEvent) => void;
+  /** Clear all session feeds + stage (after a server reset). hwm → -1 so a fresh seqNo 0 is accepted. */
+  resetAll: () => void;
 
   setMicOn: (on: boolean) => void;
   setMicLevel: (level: number) => void;
@@ -110,6 +123,7 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
   playCount: 0,
   lastPlayAt: null,
   stats: null,
+  decisions: [],
 
   micOn: false,
   micLevel: 0,
@@ -166,6 +180,17 @@ export const useHarnessStore = create<HarnessState>()((set) => ({
   notePlay: () => set((prev) => ({ playCount: prev.playCount + 1, lastPlayAt: Date.now() })),
 
   setStats: (stats) => set({ stats }),
+
+  appendDecision: (d) => set((prev) => ({ decisions: [...prev.decisions, d].slice(-MAX_DECISIONS) })),
+
+  resetAll: () =>
+    set({
+      transcript: [],
+      deliverables: [],
+      hwm: { transcript: -1, deliverables: -1 },
+      render: null,
+      decisions: [],
+    }),
 
   setMicOn: (on) => set({ micOn: on, micLevel: 0 }),
   setMicLevel: (level) => set({ micLevel: level }),

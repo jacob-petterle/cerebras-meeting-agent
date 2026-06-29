@@ -313,3 +313,70 @@ describe('orchestrator + transcript write-back (the main.ts dispatch wrapper)', 
     expect(transcript.snapshot()).toHaveLength(2);
   });
 });
+
+/**
+ * The decision feed + reset (tasks #13/#14). onDecision must fire for EVERY decision, including
+ * no_op (which dispatches nothing and is otherwise invisible). reset() must rewind the cursor and
+ * invalidate any in-flight tick so its deferred cursor write can't resurrect a wiped span.
+ */
+describe('orchestrator: decision feed + reset', () => {
+  it('onDecision fires for every decision, including no_op (which dispatches nothing)', async () => {
+    const transcript = createAppendLog<TranscriptEntry>();
+    transcript.append(entry('hi')); // seqNo 0
+    const seen: Decision[] = [];
+    const decide = vi.fn(async (_d: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
+      name: 'no_op',
+      args: {},
+    }));
+    const dispatch = vi.fn(async (_d: Decision) => {});
+    const { scheduler, tick } = fakeScheduler();
+
+    const orch = createOrchestrator({
+      transcript,
+      decide,
+      dispatch,
+      scheduler,
+      onDecision: (d) => seen.push(d),
+    });
+    orch.start();
+    await tick();
+
+    expect(dispatch).not.toHaveBeenCalled(); // no_op acts on nothing…
+    expect(seen).toEqual([{ name: 'no_op', args: {} }]); // …but is still reported to the feed.
+  });
+
+  it('reset() rewinds the cursor to -1 and a guarded in-flight dispatch cannot clobber it', async () => {
+    const transcript = createAppendLog<TranscriptEntry>();
+    transcript.append(entry('research X')); // seqNo 0 → claimedHead 0
+
+    let release!: () => void;
+    const gate = new Promise<void>((res) => {
+      release = res;
+    });
+    const decide = vi.fn(async (_d: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
+      name: 'call_agent',
+      args: { task: 'X' },
+    }));
+    const dispatch = vi.fn(async (d: Decision) => {
+      if (d.name === 'call_agent') await gate;
+    });
+    const { scheduler, tick } = fakeScheduler();
+    const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
+    orch.start();
+
+    // Tick 1: starts call_agent; it parks on the gate, so the cursor has NOT advanced yet.
+    await tick();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(orch.getCursor().transcript).toBe(-1);
+
+    // Reset while the action is in-flight: cursor → -1 and the generation is bumped.
+    orch.reset();
+    expect(orch.getCursor().transcript).toBe(-1);
+
+    // The in-flight dispatch resolves. WITHOUT the guard it would advance the cursor to claimedHead
+    // (0); the reset's generation bump must make that deferred write a no-op, leaving the cursor at -1.
+    release();
+    await flush();
+    expect(orch.getCursor().transcript).toBe(-1);
+  });
+});

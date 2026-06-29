@@ -1,18 +1,20 @@
 import { type ComponentType, type KeyboardEvent, useMemo, useRef, useState } from 'react';
 import type { SVGProps } from 'react';
-import { IconFile, IconTool, IconTranscript } from '../lib/icons';
+import { IconActivity, IconFile, IconTool, IconTranscript } from '../lib/icons';
 import { useHarnessStore } from '../store';
+import { DecisionFeed } from './decision-feed';
 import { Deliverables } from './deliverables';
 import { Hud } from './hud';
 import { ToolFeed } from './tool-feed';
 import { Transcript } from './transcript';
 
-type TabKey = 'transcript' | 'tools' | 'deliverables';
+type TabKey = 'transcript' | 'brain' | 'tools' | 'deliverables';
 type IconCmp = ComponentType<SVGProps<SVGSVGElement> & { size?: number }>;
 
-const ORDER: TabKey[] = ['transcript', 'tools', 'deliverables'];
+const ORDER: TabKey[] = ['transcript', 'brain', 'tools', 'deliverables'];
 const TABS: { key: TabKey; label: string; Icon: IconCmp }[] = [
   { key: 'transcript', label: 'Transcript', Icon: IconTranscript },
+  { key: 'brain', label: 'Brain', Icon: IconActivity },
   { key: 'tools', label: 'Tools', Icon: IconTool },
   { key: 'deliverables', label: 'Deliverables', Icon: IconFile },
 ];
@@ -26,6 +28,7 @@ export function Console() {
   const [active, setActive] = useState<TabKey>('transcript');
   const transcript = useHarnessStore((state) => state.transcript);
   const deliverables = useHarnessStore((state) => state.deliverables);
+  const decisions = useHarnessStore((state) => state.decisions);
   const tabRefs = useRef<Partial<Record<TabKey, HTMLButtonElement | null>>>({});
 
   const counts = useMemo(() => {
@@ -36,8 +39,8 @@ export function Console() {
       else convo += 1;
     }
     const ids = new Set(deliverables.map((entry) => entry.data.id));
-    return { transcript: convo, tools, deliverables: ids.size };
-  }, [transcript, deliverables]);
+    return { transcript: convo, brain: decisions.length, tools, deliverables: ids.size };
+  }, [transcript, deliverables, decisions]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     const idx = ORDER.indexOf(active);
@@ -90,6 +93,7 @@ export function Console() {
           tabIndex={0}
         >
           {active === 'transcript' ? <Transcript /> : null}
+          {active === 'brain' ? <DecisionFeed /> : null}
           {active === 'tools' ? <ToolFeed /> : null}
           {active === 'deliverables' ? <Deliverables /> : null}
         </div>

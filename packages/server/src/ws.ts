@@ -41,12 +41,16 @@ const PcmMsg = z.object({
   pcm: z.array(z.number()),
 });
 
-const ClientMsg = z.discriminatedUnion('type', [SubscribeMsg, FetchOlderMsg, PcmMsg]);
+const ResetMsg = z.object({ type: z.literal('reset') });
+
+const ClientMsg = z.discriminatedUnion('type', [SubscribeMsg, FetchOlderMsg, PcmMsg, ResetMsg]);
 
 export interface WsServerDeps {
   resources: Resources;
   /** Inbound speaker-tagged PCM (mic now; Zoom later). */
   onPcm?: (frame: PcmFrame) => void;
+  /** Invoked when a client requests a session reset (wipe logs + reset the brain cursor). */
+  onReset?: () => void;
   /** 0 ⇒ ephemeral port; the chosen port is resolved via `whenReady`. */
   port: number;
   host?: string;
@@ -63,6 +67,8 @@ export interface WsServerHandle {
     promptTokens: number;
     completionTokens: number;
   }): void;
+  /** Push a brain decision (incl. no_op) to the console's decision feed. */
+  broadcastDecision(decision: { name: string; detail: string; ts: number }): void;
   close(): Promise<void>;
 }
 
@@ -155,6 +161,12 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
           });
           return;
         }
+        case 'reset': {
+          /** Wipe server-side state, then tell every client to clear its view. */
+          deps.onReset?.();
+          for (const client of clients) send(client, { type: 'reset' });
+          return;
+        }
       }
     });
 
@@ -185,6 +197,11 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
           promptTokens: stats.promptTokens,
           completionTokens: stats.completionTokens,
         });
+      }
+    },
+    broadcastDecision(decision): void {
+      for (const ws of clients) {
+        send(ws, { type: 'decision', name: decision.name, detail: decision.detail, ts: decision.ts });
       }
     },
     close(): Promise<void> {
