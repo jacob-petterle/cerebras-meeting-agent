@@ -100,7 +100,7 @@ const dline = (over: Partial<DeliverableRecord>, seqNo = 0): LogEntry<Deliverabl
 
 describe('resource rendering — conversation is a resource, not in-band', () => {
   it('wraps each utterance in an XML <transcript> envelope, never a bare line', () => {
-    const out = renderTranscriptResource([tline({ text: "what's the weather" })]);
+    const out = renderTranscriptResource([tline({ text: "what's the weather" })], 0);
     expect(out).toMatch(/^<transcript\b/);
     expect(out).toContain('</transcript>');
     expect(out).toContain('<utterance speaker="me" kind="human"');
@@ -113,28 +113,67 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
   });
 
   it('marks the agent\'s own prior turns kind="agent" so it recognizes itself', () => {
-    const out = renderTranscriptResource([tline({ senderKind: 'agent', participantId: 'agent', text: 'four' })]);
+    const out = renderTranscriptResource(
+      [tline({ senderKind: 'agent', participantId: 'agent', text: 'four' })],
+      0,
+    );
     expect(out).toContain('<utterance speaker="agent" kind="agent"');
     expect(out).toContain('>four</utterance>');
   });
 
   it('marks tool turns kind="tool"', () => {
-    const out = renderTranscriptResource([
-      tline({ senderKind: 'tool', participantId: 'call_agent', text: 'researched X' }),
-    ]);
+    const out = renderTranscriptResource(
+      [tline({ senderKind: 'tool', participantId: 'call_agent', text: 'researched X' })],
+      0,
+    );
     expect(out).toContain('<utterance speaker="call_agent" kind="tool"');
   });
 
   it('escapes utterance text so it cannot break out of the envelope', () => {
-    const out = renderTranscriptResource([tline({ text: 'use <script> & "quotes"' })]);
+    const out = renderTranscriptResource([tline({ text: 'use <script> & "quotes"' })], 0);
     expect(out).toContain('use &lt;script&gt; &amp; &quot;quotes&quot;');
     expect(out).not.toContain('<script>');
   });
 
   it('renders an empty transcript as a self-closing block (still a resource)', () => {
-    const out = renderTranscriptResource([]);
+    const out = renderTranscriptResource([], 0);
     expect(out).toMatch(/^<transcript\b[^>]*\/>$/);
-    expect(out).toContain('no new utterances');
+    expect(out).toContain('empty');
+  });
+
+  it('renders the FULL conversation each beat and marks only new-since utterances new="true"', () => {
+    // Three utterances; the boundary is seqNo 2 → only the last one is new this beat.
+    const entries = [
+      tline({ text: 'old one', participantId: 'me' }, 0),
+      tline({ text: 'old two', participantId: 'me' }, 1),
+      tline({ text: 'fresh', participantId: 'me' }, 2),
+    ];
+    const out = renderTranscriptResource(entries, 2);
+    // The whole conversation is present (full memory), not just the delta.
+    expect(out).toContain('>old one</utterance>');
+    expect(out).toContain('>old two</utterance>');
+    expect(out).toContain('>fresh</utterance>');
+    // Only the boundary-and-after utterance carries new="true".
+    expect(out).toMatch(/new="true"[^>]*>fresh<\/utterance>/);
+    expect(out).not.toMatch(/new="true"[^>]*>old one<\/utterance>/);
+    expect(out).not.toMatch(/new="true"[^>]*>old two<\/utterance>/);
+    // Exactly one utterance is marked new.
+    expect(out.match(/new="true"/g)).toHaveLength(1);
+    // The framing tells the model it's the full conversation and to act only on the new ones.
+    expect(out).toContain('full conversation');
+    expect(out).toContain('new-since="2"');
+  });
+
+  it('caps the rendered transcript to the most-recent ~100 utterances (keeps newest, notes elision)', () => {
+    const entries = Array.from({ length: 150 }, (_v, i) =>
+      tline({ text: `line ${i}`, participantId: 'me' }, i),
+    );
+    const out = renderTranscriptResource(entries, 150);
+    // Oldest are elided; the newest are kept.
+    expect(out).not.toContain('>line 0</utterance>');
+    expect(out).toContain('>line 149</utterance>');
+    expect(out).toContain('elided-older="50"');
+    expect(out).toContain('showing-last="100"');
   });
 
   it('renders deliverables as XML with id + kind + title (for share_screen)', () => {
@@ -150,7 +189,11 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
   });
 
   it('renderResources carries current-time + transcript + deliverables', () => {
-    const out = renderResources({ transcript: [tline({ text: 'hi' })], deliverables: [dline({})] });
+    const out = renderResources({
+      transcript: [tline({ text: 'hi' })],
+      newSinceSeqNo: 0,
+      deliverables: [dline({})],
+    });
     expect(out).toContain('<current-time iso=');
     expect(out).toContain('<transcript');
     expect(out).toContain('<deliverables');
@@ -166,6 +209,7 @@ describe('buildResourceMessages — nothing in band', () => {
   const msgs = buildResourceMessages({
     system: 'IDENTITY+CONVENTION',
     transcript: [tline({ text: 'deploy on friday' })],
+    newSinceSeqNo: 0,
     deliverables: [dline({ title: 'Risk memo' })],
   });
 

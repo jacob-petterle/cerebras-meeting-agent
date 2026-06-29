@@ -31,6 +31,13 @@ import type { AssembledResult, AssembledToolCall, CerebrasClient } from './cereb
 /** Cap how many of the most-recent deliverables are folded into the loop, to keep the prompt lean. */
 const MAX_DELIVERABLES_IN_CONTEXT = 8;
 
+/**
+ * Cap how many of the most-recent utterances we render. The model now sees the FULL conversation each
+ * beat (not just the delta) so it keeps memory of earlier context; this bound keeps the prompt sane on
+ * a long session. The newest utterances are always kept (we slice the tail).
+ */
+const MAX_TRANSCRIPT_IN_CONTEXT = 100;
+
 /** One parsed decision: which tool + its raw args (validated downstream by the registry). */
 export interface Decision {
   name: ToolName;
@@ -182,25 +189,40 @@ function xmlEscape(s: string): string {
 }
 
 /**
- * Render the transcript delta as an OBSERVED resource block — a named XML envelope, the same shape
+ * Render the FULL transcript as an OBSERVED resource block — a named XML envelope, the same shape
  * Shipyard emits for <task-metadata>/<branch> (task-metadata-resolver.ts `renderEnvelope`). The
  * speakers are talking to each other; the model is an observer, so this is NEVER a message addressed
  * to it. `kind` distinguishes a human, the model's own prior turns (agent), and tool side effects.
+ *
+ * The model sees the WHOLE conversation each beat (full memory), but only utterances whose seqNo is
+ * `>= newSinceSeqNo` carry `new="true"` — those are the ones that arrived since the last beat. The
+ * model reads everything for context but should only ACT on the new openings. This is how we keep
+ * memory while the orchestrator's cursor keeps advancing past no_op'd content: the cursor is just the
+ * boundary that decides which utterances are marked new, not what the model is allowed to remember.
+ *
+ * Bounded to the most-recent {@link MAX_TRANSCRIPT_IN_CONTEXT} utterances so the prompt stays sane on
+ * a long session; the cap is surfaced on the envelope so the model knows older lines may be elided.
  */
-export function renderTranscriptResource(delta: LogEntry<TranscriptEntry>[]): string {
+export function renderTranscriptResource(
+  entries: LogEntry<TranscriptEntry>[],
+  newSinceSeqNo: number,
+): string {
   const T = XML_TAGS.TRANSCRIPT;
-  if (delta.length === 0) {
-    return `<${T} note="no new utterances since you last observed" />`;
+  if (entries.length === 0) {
+    return `<${T} note="the conversation is empty so far" />`;
   }
-  const since = delta[0]?.seqNo ?? 0;
-  const lines = delta
-    .map(
-      (e) =>
-        `  <utterance speaker="${xmlEscape(e.data.participantId)}" kind="${e.data.senderKind}" ts="${e.data.timestamp}">${xmlEscape(e.data.text)}</utterance>`,
-    )
+  const capped = entries.slice(-MAX_TRANSCRIPT_IN_CONTEXT);
+  const elided = entries.length - capped.length;
+  const lines = capped
+    .map((e) => {
+      /** Mark utterances new since the last beat so the model knows what to consider acting on. */
+      const isNew = e.seqNo >= newSinceSeqNo ? ' new="true"' : '';
+      return `  <utterance speaker="${xmlEscape(e.data.participantId)}" kind="${e.data.senderKind}" ts="${e.data.timestamp}"${isNew}>${xmlEscape(e.data.text)}</utterance>`;
+    })
     .join('\n');
+  const cap = elided > 0 ? ` showing-last="${capped.length}" elided-older="${elided}"` : '';
   return (
-    `<${T} since="${since}" note="live room audio, transcribed — the speakers are talking to each other, not to you; only utterances new since you last observed are shown">\n` +
+    `<${T} new-since="${newSinceSeqNo}"${cap} note="the full conversation so far, live room audio transcribed — the speakers are talking to each other, not to you; utterances tagged as new arrived since you last observed, act only on those">\n` +
     lines +
     `\n</${T}>`
   );
@@ -242,11 +264,12 @@ function renderCurrentTime(): string {
  */
 export function renderResources(args: {
   transcript: LogEntry<TranscriptEntry>[];
+  newSinceSeqNo: number;
   deliverables: LogEntry<DeliverableRecord>[];
 }): string {
   return [
     renderCurrentTime(),
-    renderTranscriptResource(args.transcript),
+    renderTranscriptResource(args.transcript, args.newSinceSeqNo),
     renderDeliverablesResource(args.deliverables),
   ].join('\n');
 }
@@ -268,10 +291,17 @@ const HEARTBEAT_PULSE =
  */
 export function buildResourceMessages(args: {
   system: string;
+  /** The FULL transcript snapshot — the model observes the whole conversation each beat. */
   transcript: LogEntry<TranscriptEntry>[];
+  /** Boundary seqNo: utterances with seqNo >= this are marked new (arrived since the last beat). */
+  newSinceSeqNo: number;
   deliverables: LogEntry<DeliverableRecord>[];
 }): ChatCompletionMessageParam[] {
-  const resources = renderResources({ transcript: args.transcript, deliverables: args.deliverables });
+  const resources = renderResources({
+    transcript: args.transcript,
+    newSinceSeqNo: args.newSinceSeqNo,
+    deliverables: args.deliverables,
+  });
   return [
     { role: 'system', content: args.system },
     { role: 'system', content: resources },
@@ -298,6 +328,14 @@ export interface DecideDeps {
    */
   deliverables: AppendLog<DeliverableRecord>;
   /**
+   * The transcript resource. The model now observes the FULL conversation every beat (not just the
+   * heartbeat delta) so it keeps memory of earlier context. The orchestrator still triggers on the
+   * delta and hands `decide` the delta; `decide` uses the delta's first seqNo as the new-boundary and
+   * reads the full snapshot HERE for context. Marking new-since-last-beat utterances is what lets the
+   * model remember everything while still acting only on the fresh openings.
+   */
+  transcript: AppendLog<TranscriptEntry>;
+  /**
    * Optional sink for live inference stats. Called after each `cerebras.complete` with the
    * assembled result's usage + wall-clock tok/s, so the wiring can broadcast it to the web HUD
    * (the rate is otherwise computed in cerebras.ts and discarded). Errors here are not propagated.
@@ -313,12 +351,20 @@ export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry
   const system = buildSystemPrompt(deps.context);
   return async (delta) => {
     /**
+     * The new-boundary for THIS beat: the seqNo of the first delta entry (what the orchestrator just
+     * handed us as "new since last observed"). When the delta is empty (decide called outside the
+     * orchestrator), fall back to one past the current head so nothing is marked new.
+     */
+    const newSinceSeqNo = delta[0]?.seqNo ?? deps.transcript.head() + 1;
+    /**
      * Assemble the beat so nothing is in-band: identity+convention and the observed resource
-     * envelopes go in the SYSTEM channel; the only user turn is a content-free heartbeat pulse.
+     * envelopes go in the SYSTEM channel; the only user turn is a content-free heartbeat pulse. The
+     * transcript block is the FULL conversation snapshot with the new utterances marked.
      */
     const messages = buildResourceMessages({
       system,
-      transcript: delta,
+      transcript: deps.transcript.snapshot(),
+      newSinceSeqNo,
       deliverables: deps.deliverables.snapshot(),
     });
     const result = await deps.cerebras.complete({

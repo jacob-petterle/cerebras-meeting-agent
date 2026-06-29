@@ -5,7 +5,8 @@ import { createDecide, type Decision } from './core/decide';
 import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
 import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
-import { createCallAgentMock } from './core/tools/callAgent/mock';
+import { createCallAgentMock, type CallAgentFn } from './core/tools/callAgent/mock';
+import { createCallAgentCursor } from './core/tools/callAgent/cursor';
 import { createVad, createStt, createTts } from './media';
 import { createWsServer } from './ws';
 import { createAudioInWs } from './adapters/local/audioInWs';
@@ -77,6 +78,8 @@ async function main(): Promise<void> {
   }
 
   const apiKey = process.env.CEREBRAS_API_KEY ?? '';
+  /** Cursor account key for the real sub-agent. Absent → the mock call_agent (no-key path) is used. */
+  const cursorKey = process.env.CURSOR_API_KEY ?? '';
 
   // Resource spine (transcript + deliverables append-logs).
   const resources = createResources();
@@ -150,17 +153,36 @@ async function main(): Promise<void> {
       context: SESSION_CONTEXT,
       /** The deliverables resource — observed as a `<deliverables>` block each tick (not in-band). */
       deliverables: resources.deliverables,
+      /** The transcript resource — the model observes the FULL conversation each beat (new marked). */
+      transcript: resources.transcript,
       /** Live tok/s + token counts → the web HUD (otherwise computed in cerebras.ts and discarded). */
       onStats: (stats) => ws.broadcastStats(stats),
     });
-    const callAgent = createCallAgentMock({
-      deliverables: resources.deliverables,
-      outDir: '.deliverables',
-    });
+    /**
+     * call_agent backend: the REAL Cursor SDK when a CURSOR_API_KEY is present (it investigates the
+     * working tree and writes a real findings doc), otherwise the mock (the no-key path, keeps the
+     * spine exercisable without credentials). Both honour the same `(args) => Promise<DeliverableRecord>`
+     * contract and append to the same deliverables log.
+     */
+    const callAgent: CallAgentFn = cursorKey
+      ? createCallAgentCursor({
+          deliverables: resources.deliverables,
+          outDir: '.deliverables',
+          apiKey: cursorKey,
+          cwd: process.cwd(),
+          onProgress: (l) => console.log(l),
+        })
+      : createCallAgentMock({
+          deliverables: resources.deliverables,
+          outDir: '.deliverables',
+        });
+    console.log(`[main] call_agent: ${cursorKey ? 'real Cursor SDK' : 'mock'}`);
     const registry = createRegistry({
       ports,
       tts: (text) => tts.synthesize(text),
       callAgent,
+      /** Resolve share_screen{deliverableId} to the real findings file so the stage shows it (Task C). */
+      deliverables: resources.deliverables,
     });
     const orchestrator = createOrchestrator({
       transcript: resources.transcript,
