@@ -2,7 +2,7 @@ import '../../../lib/configure-ripgrep';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Agent, type ModelSelection } from '@cursor/sdk';
+import { Agent, type ModelSelection, type McpServerConfig } from '@cursor/sdk';
 import { type CallAgentArgs, DeliverableRecord, SubAgentTaskRecord } from '@meeting-agent/protocol';
 import { isRecord } from '../../../lib/is-record';
 import type { AppendLog } from '../../resources';
@@ -86,6 +86,8 @@ export interface CursorAgentFactoryOptions {
   /** Full model selection: `{ id, params }` (id + the fast-mode variant param). */
   model: ModelSelection;
   cwd: string;
+  /** MCP servers exposed to the agent (e.g. Datadog), keyed by server name. Omitted ⇒ none. */
+  mcpServers?: Record<string, McpServerConfig>;
 }
 
 /** Injection seam: how to build a Cursor agent. Defaults to the real `Agent.create` (local mode). */
@@ -107,6 +109,11 @@ export interface CallAgentCursorDeps {
   cwd: string;
   /** Cursor model id; defaults to `composer-2.5`. Fast mode is always applied as a variant param. */
   model?: string;
+  /**
+   * MCP servers the sub-agent may use (e.g. Datadog), keyed by name. Passed straight to the Cursor
+   * agent; its tools auto-register and the model can call them. Omitted ⇒ the sub-agent has none.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
   /** Wall-clock budget per call in ms; defaults to 90_000. */
   timeoutMs?: number;
   /** Live progress sink for streamed events; defaults to `console.log` with a `[cursor]` prefix. */
@@ -126,7 +133,31 @@ function defaultAgentFactory(opts: CursorAgentFactoryOptions): Promise<CursorAge
     name: opts.name,
     model: opts.model,
     local: { cwd: opts.cwd },
+    ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
   });
+}
+
+/**
+ * Build the Datadog MCP server config (shelfio `datadog-mcp` over stdio — the SAME server the team
+ * uses in Claude Code) from env. Returns `{ datadog: ... }` only when both keys are present, so the
+ * sub-agent simply has no Datadog tools when creds are unset (no error). The keys are passed into the
+ * spawned server's OWN env; `uvx` must be on PATH where the brain runs (the Mac host). DD_SITE defaults
+ * to us5 to match the team account.
+ */
+export function datadogMcpFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, McpServerConfig> | undefined {
+  const DD_API_KEY = env.DD_API_KEY;
+  const DD_APP_KEY = env.DD_APP_KEY;
+  if (!DD_API_KEY || !DD_APP_KEY) return undefined;
+  return {
+    datadog: {
+      type: 'stdio',
+      command: 'uvx',
+      args: ['--from', 'git+https://github.com/shelfio/datadog-mcp.git', 'datadog-mcp'],
+      env: { DD_API_KEY, DD_APP_KEY, DD_SITE: env.DD_SITE ?? 'us5.datadoghq.com' },
+    },
+  };
 }
 
 /**
@@ -144,12 +175,22 @@ function defaultAgentFactory(opts: CursorAgentFactoryOptions): Promise<CursorAge
  * markdown that may use code blocks, tables, and mermaid diagrams wherever they convey a finding more
  * clearly than prose. There is NO slide budget and NO screenful limit — completeness and clarity win.
  */
-function buildPrompt(task: string, findingsPath: string): string {
+function buildPrompt(task: string, findingsPath: string, mcpServerNames: string[] = []): string {
+  const mcpNudge = mcpServerNames.includes('datadog')
+    ? [
+        'You have a Datadog MCP server connected: use its tools to query LIVE operational data —',
+        'metrics, logs, monitors, events, incidents — whenever the task involves system health,',
+        'errors, performance, or "what is happening in prod". Prefer real Datadog data over guessing,',
+        'and chain multiple queries to investigate (e.g. metric spike → correlated logs → the monitor).',
+        '',
+      ]
+    : [];
   return [
     'You are a research sub-agent for a meeting assistant. Carry out the task below against the current',
     'working directory. Your findings are READ BY THE ASSISTANT (not shown to anyone), so write them to',
     'be understood by a reader — completely and clearly. This is NOT a slide; there is no length limit.',
     '',
+    ...mcpNudge,
     'Write your findings as a markdown document to EXACTLY this path:',
     `  ${findingsPath}`,
     '',
@@ -336,6 +377,8 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const baseOnProgress = deps.onProgress ?? ((line: string) => console.log(line));
   const agentFactory = deps.agentFactory ?? defaultAgentFactory;
+  const mcpServers = deps.mcpServers;
+  const mcpServerNames = mcpServers ? Object.keys(mcpServers) : [];
   /** Absolute so the agent (which runs in `cwd`) and the server (which reads here) agree on the path. */
   const outDir = resolve(deps.outDir);
 
@@ -371,8 +414,8 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
     let agent: CursorAgent | null = null;
     try {
       onProgress(`[cursor] dispatching sub-agent (model=${modelId}, fast) for: ${args.task}`);
-      agent = await agentFactory({ apiKey: deps.apiKey, name: 'meeting-triage', model, cwd: deps.cwd });
-      const run = await agent.send(buildPrompt(args.task, findingsPath));
+      agent = await agentFactory({ apiKey: deps.apiKey, name: 'meeting-triage', model, cwd: deps.cwd, mcpServers });
+      const run = await agent.send(buildPrompt(args.task, findingsPath, mcpServerNames));
 
       /** Stream for live progress WHILE the run executes; swallow stream errors (cosmetic). */
       const streaming = pumpStream(run, onProgress).catch((err: unknown) => {

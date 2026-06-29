@@ -11,7 +11,7 @@ import { createOrchestrator, intervalScheduler, type Orchestrator } from './core
 import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
 import { createCallAgentMock, type CallAgentFn } from './core/tools/callAgent/mock';
-import { createCallAgentCursor } from './core/tools/callAgent/cursor';
+import { createCallAgentCursor, datadogMcpFromEnv } from './core/tools/callAgent/cursor';
 import { createVad, createStt, createTts } from './media';
 import { createWsServer, type WsServerHandle } from './ws';
 import { createAudioInWs } from './adapters/local/audioInWs';
@@ -372,6 +372,8 @@ async function main(): Promise<void> {
      * spine exercisable without credentials). Both honour the same `(args) => Promise<DeliverableRecord>`
      * contract and append to the same deliverables log.
      */
+    /** Datadog MCP for the sub-agent (composer-2.5): present only when DD_API_KEY + DD_APP_KEY are set. */
+    const mcpServers = datadogMcpFromEnv();
     const callAgent: CallAgentFn = cursorKey
       ? createCallAgentCursor({
           deliverables: resources.deliverables,
@@ -384,6 +386,8 @@ async function main(): Promise<void> {
           timeoutMs: CURSOR_AGENT_TIMEOUT_MS,
           /** Optional model override; defaults to composer-2.5 (fast mode) in cursor.ts. */
           model: process.env.CURSOR_AGENT_MODEL || undefined,
+          /** Datadog MCP (shelfio, stdio) so the sub-agent can query live metrics/logs/monitors. */
+          mcpServers,
           onProgress: (l) => console.log(l),
         })
       : createCallAgentMock({
@@ -391,7 +395,8 @@ async function main(): Promise<void> {
           outDir: join(REPO_ROOT, '.deliverables'),
         });
     console.log(
-      `[main] call_agent: ${cursorKey ? `real Cursor SDK — ${process.env.CURSOR_AGENT_MODEL || 'composer-2.5'} (fast), cwd=${CURSOR_AGENT_CWD}` : 'mock'}`,
+      `[main] call_agent: ${cursorKey ? `real Cursor SDK — ${process.env.CURSOR_AGENT_MODEL || 'composer-2.5'} (fast), cwd=${CURSOR_AGENT_CWD}` : 'mock'}` +
+        (mcpServers ? ` + MCP[${Object.keys(mcpServers).join(',')}]` : ''),
     );
     const registry = createRegistry({
       ports,
