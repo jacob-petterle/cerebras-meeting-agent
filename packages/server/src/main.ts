@@ -19,6 +19,18 @@ import { createAudioOutUplink } from './adapters/zoom/audioOutUplink';
 import { createDisplayShare } from './adapters/zoom/displayShare';
 import type { AudioInPort, AudioOutPort, DisplayPort, Ports } from './core/ports';
 
+// Load .env FIRST — before the env-derived consts below are read at module-load time. Doing this
+// inside main() (as it was) runs too late: ZOOM/BOT_OUT_DIR/BOT_TTS_PORT/EXCLUDE_NODE_ID would have
+// already read an empty process.env, so `.env` silently never set them (only the ambient shell did).
+for (const candidate of ['.env', fileURLToPath(new URL('../../../.env', import.meta.url))]) {
+  try {
+    process.loadEnvFile?.(candidate);
+    break;
+  } catch {
+    /* not at this path — try the next candidate (ambient env still applies) */
+  }
+}
+
 /**
  * Entrypoint — wires the transport-agnostic core to an adapter set:
  *   browser mic (WS pcm) → VAD → STT → raw buffer (corrected on the heartbeat) → transcript
@@ -103,18 +115,7 @@ process.on('uncaughtException', (err) => {
 });
 
 async function main(): Promise<void> {
-  // Load env (Node >= 20.12 / 22). `pnpm dev` runs with cwd=packages/server (pnpm --filter), so the
-  // repo-root .env is NOT at cwd — try cwd first, then the repo-root .env resolved relative to this
-  // module (../../../ from packages/server/src/main.ts). First file that loads wins; absent is fine.
-  for (const candidate of ['.env', fileURLToPath(new URL('../../../.env', import.meta.url))]) {
-    try {
-      process.loadEnvFile?.(candidate);
-      break;
-    } catch {
-      /* not at this path — try the next candidate (ambient env still applies) */
-    }
-  }
-
+  // .env was already loaded at module top (see above) so the env-derived consts picked it up.
   const apiKey = process.env.CEREBRAS_API_KEY ?? '';
   /** With a brain (key present) STT is buffered + corrected on the heartbeat; without one it streams raw. */
   const brainEnabled = apiKey.length > 0;

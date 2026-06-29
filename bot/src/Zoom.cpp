@@ -312,6 +312,14 @@ SDKError Zoom::startRawRecording() {
             m_audioSource = new ZoomSDKAudioRawDataDelegate(mixedAudio, transcribe);
             m_audioSource->setDir(m_config.audioDir());
             m_audioSource->setFilename(m_config.audioFile());
+
+            // Tell the delegate our OWN user-id so it never writes node-<self>.pcm — the bot must not
+            // capture/transcribe its own audio (silence + injected TTS). Removes the EXCLUDE_NODE_ID dance.
+            auto* partCtl = m_meetingService->GetMeetingParticipantsController();
+            if (partCtl) {
+                auto* self = partCtl->GetMySelfUser();
+                if (self) m_audioSource->setExcludeNodeId(self->GetUserID());
+            }
         }
 
         err = m_audioHelper->subscribe(m_audioSource);

@@ -32,6 +32,10 @@ void ZoomSDKAudioRawDataDelegate::onMixedAudioRawDataReceived(AudioRawData *data
 void ZoomSDKAudioRawDataDelegate::onOneWayAudioRawDataReceived(AudioRawData* data, uint32_t node_id) {
     if (m_useMixedAudio) return;
 
+    // Never capture the bot's own stream — it's the bot's own audio (silence + the TTS we inject).
+    // Skipping it at the source removes the need for any downstream EXCLUDE_NODE_ID wiring.
+    if (m_excludeNodeId != 0 && node_id == m_excludeNodeId) return;
+
     stringstream path;
     path << m_dir << "/node-" << node_id << ".pcm";
     writeToFile(path.str(), data);
@@ -79,4 +83,9 @@ string ZoomSDKAudioRawDataDelegate::filename() const
 void ZoomSDKAudioRawDataDelegate::setFilename(const string &filename)
 {
     m_filename = filename;
+}
+
+void ZoomSDKAudioRawDataDelegate::setExcludeNodeId(uint32_t id)
+{
+    m_excludeNodeId = id;
 }

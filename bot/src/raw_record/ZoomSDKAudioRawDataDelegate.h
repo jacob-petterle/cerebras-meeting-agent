@@ -22,6 +22,9 @@ class ZoomSDKAudioRawDataDelegate : public IZoomSDKAudioRawDataDelegate {
     string m_filename = "test.pcm";
     bool m_useMixedAudio;
     bool m_transcribe;
+    /** The bot's OWN user-id. Its one-way stream is the bot's own audio (silence + the TTS we inject);
+     *  we never want to capture/transcribe it, so per-speaker writes for this id are skipped. 0 = none. */
+    uint32_t m_excludeNodeId = 0;
 
     void writeToFile(const string& path, AudioRawData* data);
 public:
@@ -30,6 +33,8 @@ public:
     void setDir(const string& dir);
     string filename() const;
     void setFilename(const string& filename);
+    /** Set the bot's own user-id so its per-speaker stream is never written (no self-capture). */
+    void setExcludeNodeId(uint32_t id);
 
     void onMixedAudioRawDataReceived(AudioRawData* data) override;
     void onOneWayAudioRawDataReceived(AudioRawData* data, uint32_t node_id) override;
