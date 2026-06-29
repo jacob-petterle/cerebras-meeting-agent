@@ -60,8 +60,8 @@ grep -E "ZOOM mode|brain enabled" /tmp/zoom-server.log 2>/dev/null | tail -2 || 
 cat <<'NEXT'
 
 ── after the bot joins, do these in Zoom (host-UI only) ───────────────────
-   1. admit "Triage Bot" from the waiting room (or disable Waiting Room to skip)
-   2. grant it RECORDING permission (Participants → Triage Bot → ⋯ → Allow Record)
+   1. admit "Atlas" from the waiting room (or disable Waiting Room to skip)
+   2. grant it RECORDING permission (Participants → Atlas → ⋯ → Allow Record)
    3. allow screen share — then talk.   logs: tail -f /tmp/zoom-server.log
    blank share?  Ctrl-C, then:  cd bot && SHARE_MODE=text docker compose up
 ───────────────────────────────────────────────────────────────────────────
