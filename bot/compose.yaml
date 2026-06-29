@@ -9,8 +9,11 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       # Stage page the headed Chromium loads (the Mac-served web stage). Default
-      # points at the team's `packages/web` Vite dev server on the host.
-      - STAGE_URL=${STAGE_URL:-http://host.docker.internal:5173}
+      # points at the team's `packages/web` Vite dev server on the host. The
+      # `?view=stage` query is REQUIRED — it renders the deliverable surface ONLY
+      # (no header/console/HUD) so the screenshare shows just the shared artifact,
+      # not the whole operator console. Without it the bot shares the entire app.
+      - STAGE_URL=${STAGE_URL:-http://host.docker.internal:5173/?view=stage}
       # Screen-share frame source: stage (capture Chromium on Xvfb) | text
       # (render out/share_text.txt). entry.sh skips launching Chromium for text.
       - SHARE_MODE=${SHARE_MODE:-stage}

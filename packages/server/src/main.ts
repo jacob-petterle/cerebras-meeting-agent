@@ -4,7 +4,6 @@ import { join, resolve } from 'node:path';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, foldLatestById, type Decision } from './core/decide';
-import { createCorrector, type RawUtterance } from './core/correct';
 import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
 import { isRecord } from './lib/is-record';
 import { createRegistry } from './core/tools/registry';
@@ -34,8 +33,8 @@ for (const candidate of ['.env', fileURLToPath(new URL('../../../.env', import.m
 
 /**
  * Entrypoint — wires the transport-agnostic core to an adapter set:
- *   browser mic (WS pcm) → VAD → STT → raw buffer (corrected on the heartbeat) → transcript
- *   4s heartbeat → correct buffered STT → Gemma decides → tools (speak/share_screen/call_agent/no_op)
+ *   browser mic (WS pcm) → VAD → STT → transcript (raw STT goes straight in — no corrector pass)
+ *   heartbeat / utterance poke → Gemma decides → tools (speak/share_screen/call_agent/no_op)
  *   speak → TTS → browser speakers ·  share_screen → browser stage
  *
  * Two adapter sets, selected by `ZOOM`:
@@ -63,7 +62,7 @@ const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
  * a finished sub-agent's deliverable to share). Lower than the old 4000 for snappier idle pickup.
  * Override with HEARTBEAT_MS (e.g. =1000 to experiment).
  */
-const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 1500);
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 1000);
 /** Repo root (…/cerebras-hackathon-prep), three up from packages/server/src/main.ts. */
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 
@@ -148,7 +147,7 @@ process.on('uncaughtException', (err) => {
 async function main(): Promise<void> {
   // .env was already loaded at module top (see above) so the env-derived consts picked it up.
   const apiKey = process.env.CEREBRAS_API_KEY ?? '';
-  /** With a brain (key present) STT is buffered + corrected on the heartbeat; without one it streams raw. */
+  /** With a brain (key present) a new utterance pokes the heartbeat to decide; raw STT always goes straight to the transcript. */
   const brainEnabled = apiKey.length > 0;
   /** Cursor account key for the real sub-agent. Absent → the mock call_agent (no-key path) is used. */
   const cursorKey = process.env.CURSOR_API_KEY ?? '';
@@ -173,17 +172,7 @@ async function main(): Promise<void> {
   let stopTransport: (() => void) | null = null;
   /** Set once the brain is enabled; the reset handler rewinds its cursor when a client clears the session. */
   let orchestratorRef: Orchestrator | null = null;
-  /**
-   * Raw STT segments awaiting correction. With the brain enabled the VAD/STT path appends HERE (not
-   * straight to the transcript); the heartbeat's correct-step drains it, corrects the batch, and
-   * appends the CORRECTED lines. `sessionEpoch` lets an in-flight correction notice a reset that
-   * raced it and drop its now-stale batch.
-   */
-  const rawBuffer: RawUtterance[] = [];
-  let sessionEpoch = 0;
   const onReset = (): void => {
-    sessionEpoch += 1;
-    rawBuffer.length = 0;
     resources.transcript.reset();
     resources.deliverables.reset();
     resources.subAgents.reset();
@@ -217,7 +206,7 @@ async function main(): Promise<void> {
 
   const ports: Ports = { audioIn, audioOut, display };
 
-  // AudioIn → VAD → STT → (raw buffer, corrected on the heartbeat) → transcript. The per-utterance
+  // AudioIn → VAD → STT → transcript (raw STT, straight in — no corrector). The per-utterance
   // VAD/STT lines are kept as terminal-side observability (the meeting agent's pipeline is meant to be
   // watchable); the high-frequency per-frame pcm log is gated behind DEBUG_PIPE so output stays readable.
   let pcmFrames = 0;
@@ -252,26 +241,15 @@ async function main(): Promise<void> {
       const text = (await stt.transcribe(u.pcm, u.sampleRate)).trim();
       console.log(`[pipe] STT→ "${text}"`);
       if (!text) return;
-      if (brainEnabled) {
-        /**
-         * Buffer the RAW segment. The heartbeat's correct-step (a Gemma pass) cleans the batch and
-         * appends the corrected line — so raw STT never reaches the transcript while the brain is on,
-         * and the brain only ever observes corrected text.
-         */
-        rawBuffer.push({ participantId: u.participantId, text, timestamp: u.ts });
-        pokeSoon(); // VAD-driven: react ~promptly after the speaker pauses, not on the fixed interval.
-      } else {
-        /**
-         * No brain (no key) → no corrector. Stream the raw line straight to the transcript so the web
-         * app still shows a live transcript even with the agent disabled.
-         */
-        resources.transcript.append({
-          participantId: u.participantId,
-          senderKind: 'human',
-          text,
-          timestamp: u.ts,
-        });
-      }
+      // Raw STT goes STRAIGHT to the transcript — no corrector / second LLM pass. The brain decides
+      // on the raw Moonshine text directly.
+      resources.transcript.append({
+        participantId: u.participantId,
+        senderKind: 'human',
+        text,
+        timestamp: u.ts,
+      });
+      if (brainEnabled) pokeSoon(); // VAD-driven: react ~promptly after the speaker pauses.
     })().catch((err) => console.error('[pipe] utterance handler failed (dropped):', err));
   });
 
@@ -311,33 +289,6 @@ async function main(): Promise<void> {
       onStats: (stats) => ws.broadcastStats(stats),
     });
     /**
-     * Transcript corrector — step ONE of each heartbeat. Drains the raw STT buffer, corrects the
-     * batch against the prior (already-corrected) conversation as context, and appends the cleaned
-     * lines to the transcript BEFORE `decide` reads it. A separate Gemma call, walled off from the
-     * brain: its own static system prompt + frozen-history prefix keep Cerebras's prompt cache warm.
-     */
-    const corrector = createCorrector({ cerebras, transcript: resources.transcript });
-    const correct = async (): Promise<void> => {
-      if (rawBuffer.length === 0) return;
-      const epoch = sessionEpoch;
-      /** Drain everything buffered so far; segments that arrive mid-correction wait for the next beat. */
-      const batch = rawBuffer.splice(0, rawBuffer.length);
-      const corrected = await corrector.correct(batch);
-      /** A reset() raced this correction (session cleared mid-call) → drop the now-stale batch. */
-      if (epoch !== sessionEpoch) return;
-      for (let i = 0; i < batch.length; i++) {
-        const seg = batch[i];
-        if (!seg) continue;
-        resources.transcript.append({
-          participantId: seg.participantId,
-          senderKind: 'human',
-          text: corrected[i] ?? seg.text,
-          timestamp: seg.timestamp,
-        });
-      }
-      console.log(`[correct] ${batch.length} raw segment(s) → corrected → transcript`);
-    };
-    /**
      * call_agent backend: the REAL Cursor SDK when a CURSOR_API_KEY is present (it investigates the
      * working tree and writes a real findings doc), otherwise the mock (the no-key path, keeps the
      * spine exercisable without credentials). Both honour the same `(args) => Promise<DeliverableRecord>`
@@ -371,12 +322,6 @@ async function main(): Promise<void> {
     });
     const orchestrator = createOrchestrator({
       transcript: resources.transcript,
-      /**
-       * Step ONE of every beat: drain the raw STT buffer, correct it, and append the cleaned lines to
-       * the transcript BEFORE the brain reads it. WITHOUT this, the buffered raw STT never drains and
-       * the transcript stays empty — the brain-enabled path has no other writer to the transcript.
-       */
-      correct,
       decide,
       /**
        * Dispatch wrapper: run the tool, then write the outcome back to the transcript so (a) the
