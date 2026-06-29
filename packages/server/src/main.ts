@@ -1,5 +1,6 @@
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, foldLatestById, type Decision } from './core/decide';
@@ -65,14 +66,37 @@ const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 1500);
 /** Repo root (…/cerebras-hackathon-prep), three up from packages/server/src/main.ts. */
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+
+/** Read a `--flag value` or `--flag=value` CLI arg from argv (first listed name to match wins). */
+function cliArg(...names: string[]): string | undefined {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (!a) continue;
+    for (const name of names) {
+      if (a === `--${name}`) return argv[i + 1];
+      if (a.startsWith(`--${name}=`)) return a.slice(name.length + 3);
+    }
+  }
+  return undefined;
+}
+
+/** Expand a leading `~` and resolve to an absolute path. */
+function resolveDir(p: string): string {
+  const expanded = p === '~' ? homedir() : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p;
+  return resolve(expanded);
+}
+
 /**
- * Where the Cursor research sub-agent runs — and what ripgrep searches. Default = THIS repo: a real
- * git tree with a .gitignore, which a real research task investigates in ~15s (proven). The HOME
- * directory was the prior default, but ripgrep then traverses all of ~ (huge, no root .gitignore) and
- * the run drags — the opposite of what a live agent needs. Override with CURSOR_AGENT_CWD to widen the
- * scope (e.g. ~/repos for cross-repo research); a tree without a sane .gitignore will be slower.
+ * Where the Cursor research sub-agent runs — and what ripgrep searches. Set it AT STARTUP with the
+ * `--cursor-cwd <path>` CLI flag (alias `--cwd`); falls back to the CURSOR_AGENT_CWD env var, then to
+ * THIS repo. The repo default is a real git tree with a .gitignore that a real task investigates in
+ * ~15s; pointing it at a tree with no sane .gitignore (e.g. all of $HOME) makes ripgrep traverse
+ * everything and the run drags. A leading `~` is expanded and the path is resolved absolute.
  */
-const CURSOR_AGENT_CWD = process.env.CURSOR_AGENT_CWD || REPO_ROOT;
+const CURSOR_AGENT_CWD = resolveDir(
+  cliArg('cursor-cwd', 'cwd') ?? process.env.CURSOR_AGENT_CWD ?? REPO_ROOT,
+);
 const SESSION_CONTEXT =
   process.env.SESSION_CONTEXT ??
   'A local test session. One human participant ("me") is speaking into a microphone. No specific project is in scope yet — be a generally helpful collaborator.';
