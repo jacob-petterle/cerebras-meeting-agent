@@ -61,15 +61,33 @@ void ZoomSDKVirtualAudioMicEvent::enqueuePCM(const char* data, size_t len) {
 
 void ZoomSDKVirtualAudioMicEvent::popFrame(char* out, size_t len) {
     lock_guard<mutex> lock(m_bufMutex);
+
+    // PRE-FILL gate. While priming, emit pure silence until a ~120 ms cushion is
+    // buffered. Starting playback with no head start is what made the old buffer
+    // underrun on the slightest delivery jitter (frames arrive at the same rate
+    // they drain, with no slack), dropping the agent's voice to silence and only
+    // recovering once data caught up. The cushion absorbs that jitter.
+    if (!m_playing) {
+        if (m_pcm.size() < c_prefillBytes) {
+            memset(out, 0, len);
+            return;
+        }
+        m_playing = true;   // cushion reached — begin draining real audio
+    }
+
     size_t available = min(len, m_pcm.size());
     for (size_t i = 0; i < available; ++i)
         out[i] = m_pcm[i];
     if (available)
         m_pcm.erase(m_pcm.begin(), m_pcm.begin() + available);
-    // Underrun: pad the rest of the frame with silence to keep the VoIP stream
-    // continuous rather than stalling the encoder.
-    if (available < len)
+
+    // Underrun (buffer ran dry mid-frame): pad this frame with silence to keep the
+    // VoIP stream continuous, then RE-ARM priming so we rebuild the cushion before
+    // resuming — far better than dribbling silence frame-by-frame on an empty buffer.
+    if (available < len) {
         memset(out + available, 0, len - available);
+        m_playing = false;
+    }
 }
 
 void ZoomSDKVirtualAudioMicEvent::senderLoop() {
