@@ -41,7 +41,6 @@ const zRenderCommand = z.object({
   kind: z.enum(RENDER_KINDS),
   payload: z.string(),
   title: z.string().optional(),
-  deliverableId: z.string().optional(),
 });
 
 const logEntry = <S extends z.ZodTypeAny>(data: S) =>

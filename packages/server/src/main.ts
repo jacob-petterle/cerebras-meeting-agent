@@ -362,8 +362,6 @@ async function main(): Promise<void> {
       ports,
       tts: (text) => tts.synthesize(text),
       callAgent,
-      /** Resolve share_screen{deliverableId} to the real findings file so the stage shows it (Task C). */
-      deliverables: resources.deliverables,
     });
     /**
      * Write a completed tool's outcome back to the transcript so (a) the model sees its own prior turns

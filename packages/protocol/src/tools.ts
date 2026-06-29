@@ -13,7 +13,6 @@ export const ShareScreenArgs = z.object({
   kind: z.enum(['html', 'mermaid', 'image', 'json', 'log', 'markdown']),
   payload: z.string(),
   title: z.string().optional(),
-  deliverableId: z.string().optional(),
 });
 export type ShareScreenArgs = z.infer<typeof ShareScreenArgs>;
 

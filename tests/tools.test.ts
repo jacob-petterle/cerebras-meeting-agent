@@ -83,67 +83,7 @@ describe('tool registry routing (decide → act)', () => {
     expect(outcome).toEqual({ senderKind: 'tool', text: 'shared a html: Demo' });
   });
 
-  it('resolves share_screen{deliverableId} to the real deliverable file contents (Task C)', async () => {
-    const { ports, rendered } = fakePorts();
-    const tts = vi.fn(
-      async (_text: string): Promise<TtsResult> => ({ pcm: new Int16Array(), sampleRate: 24000 }),
-    );
-    const callAgent = vi.fn(async (_a: CallAgentArgs) => aDeliverable());
-    const deliverables = createAppendLog<DeliverableRecordT>();
-    deliverables.append(
-      DeliverableRecord.parse({
-        id: 'deliv-real',
-        kind: 'html',
-        title: 'Findings',
-        filePath: '/tmp/FINDINGS-real.html',
-        mimeType: 'text/html',
-        producedAt: 1,
-        registeredAt: 2,
-      }),
-    );
-    // Injected reader returns the REAL file contents for the matching path.
-    const readFile = vi.fn((path: string) => {
-      if (path === '/tmp/FINDINGS-real.html') return '<h1>REAL findings</h1>';
-      throw new Error('unexpected path');
-    });
-    const reg = createRegistry({ ports, tts, callAgent, deliverables, readFile });
-
-    // The model invents a thin payload but references the deliverable — we override with the file.
-    await reg.dispatch({
-      name: 'share_screen',
-      args: { kind: 'json', payload: 're-summarized junk', deliverableId: 'deliv-real' },
-    });
-
-    expect(readFile).toHaveBeenCalledWith('/tmp/FINDINGS-real.html');
-    expect(rendered).toHaveLength(1);
-    // Real file contents rendered as html, overriding the model's kind/payload.
-    expect(rendered[0]).toMatchObject({ kind: 'html', payload: '<h1>REAL findings</h1>', deliverableId: 'deliv-real' });
-  });
-
-  it('falls back to the model payload when the deliverableId is unknown or the file is unreadable (Task C)', async () => {
-    const { ports, rendered } = fakePorts();
-    const tts = vi.fn(
-      async (_text: string): Promise<TtsResult> => ({ pcm: new Int16Array(), sampleRate: 24000 }),
-    );
-    const callAgent = vi.fn(async (_a: CallAgentArgs) => aDeliverable());
-    const deliverables = createAppendLog<DeliverableRecordT>();
-    // Reader throws (unreadable) — resolution must defensively fall back, never throw.
-    const readFile = vi.fn((_path: string): string => {
-      throw new Error('ENOENT');
-    });
-    const reg = createRegistry({ ports, tts, callAgent, deliverables, readFile });
-
-    await reg.dispatch({
-      name: 'share_screen',
-      args: { kind: 'markdown', payload: '# model payload', deliverableId: 'does-not-exist' },
-    });
-
-    // Unknown id → reader never even called; the model's payload renders unchanged.
-    expect(readFile).not.toHaveBeenCalled();
-    expect(rendered[0]).toMatchObject({ kind: 'markdown', payload: '# model payload' });
-  });
-
-  it('threads deliverableId from share_screen args into the RenderCommand', async () => {
+  it('renders share_screen without an optional title (label falls back to the kind)', async () => {
     const { ports, rendered } = fakePorts();
     const tts = vi.fn(
       async (_text: string): Promise<TtsResult> => ({ pcm: new Int16Array(), sampleRate: 24000 }),
@@ -151,14 +91,15 @@ describe('tool registry routing (decide → act)', () => {
     const callAgent = vi.fn(async (_a: CallAgentArgs) => aDeliverable());
     const reg = createRegistry({ ports, tts, callAgent });
 
-    await reg.dispatch({
+    const outcome = await reg.dispatch({
       name: 'share_screen',
-      args: { kind: 'json', payload: '{"x":1}', deliverableId: 'deliv-42' },
+      args: { kind: 'json', payload: '{"x":1}' },
     });
 
-    expect(rendered[0]).toMatchObject({ kind: 'json', deliverableId: 'deliv-42' });
-    // No title → the tool turn falls back to the kind for its label.
     expect(rendered).toHaveLength(1);
+    expect(rendered[0]).toMatchObject({ kind: 'json', payload: '{"x":1}' });
+    // No title → the tool turn falls back to the kind for its label.
+    expect(outcome).toEqual({ senderKind: 'tool', text: 'shared a json: json' });
   });
 
   it('routes call_agent → appends a Deliverable to the deliverables log', async () => {

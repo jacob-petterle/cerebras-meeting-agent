@@ -19,7 +19,6 @@ export interface RenderCommand {
   /** inline source for html/mermaid/markdown/json/log; a URL or file path for image */
   payload: string;
   title?: string;
-  deliverableId?: string;
 }
 
 /** What the `speak` tool sends to TTS → an AudioOut adapter. */

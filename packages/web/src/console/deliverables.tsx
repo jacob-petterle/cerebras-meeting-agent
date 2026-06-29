@@ -6,8 +6,8 @@ import { useHarnessStore } from '../store';
 /**
  * Deliverables list. The deliverables resource is an append-log of upserts, so the
  * list shows the last record per id (last-writer-per-id on read -- per the Resource
- * model). The record currently on the stage (matched by deliverableId on the live
- * render) is highlighted.
+ * model). These are the brain's research findings; the brain reads them and authors
+ * its own screen content, so a deliverable is never itself "on stage".
  */
 function lastPerId(entries: LogEntry<DeliverableRecord>[]): DeliverableRecord[] {
   const byId = new Map<string, DeliverableRecord>();
@@ -17,7 +17,6 @@ function lastPerId(entries: LogEntry<DeliverableRecord>[]): DeliverableRecord[] 
 
 export function Deliverables() {
   const entries = useHarnessStore((state) => state.deliverables);
-  const onStageId = useHarnessStore((state) => state.render?.deliverableId ?? null);
   const items = useMemo(() => lastPerId(entries), [entries]);
 
   if (items.length === 0) {
@@ -32,22 +31,18 @@ export function Deliverables() {
 
   return (
     <div className="scroller" role="list" aria-label="Deliverables">
-      {items.map((item) => {
-        const onStage = item.id === onStageId;
-        return (
-          <div key={item.id} className="deliv" role="listitem" data-onstage={onStage}>
-            <span className="kind" data-k={item.kind}>
-              {item.kind}
-            </span>
-            <div className="meta">
-              <span className="title">{item.title}</span>
-              {item.description ? <span className="desc">{item.description}</span> : null}
-              {item.filePath ? <span className="path">{item.filePath}</span> : null}
-            </div>
-            {onStage ? <span className="badge">on stage</span> : null}
+      {items.map((item) => (
+        <div key={item.id} className="deliv" role="listitem">
+          <span className="kind" data-k={item.kind}>
+            {item.kind}
+          </span>
+          <div className="meta">
+            <span className="title">{item.title}</span>
+            {item.description ? <span className="desc">{item.description}</span> : null}
+            {item.filePath ? <span className="path">{item.filePath}</span> : null}
           </div>
-        );
-      })}
+        </div>
+      ))}
     </div>
   );
 }

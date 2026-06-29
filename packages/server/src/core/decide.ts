@@ -97,11 +97,6 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
             description: 'Inline source (html/mermaid/markdown/json/log) or a URL/path for image.',
           },
           title: { type: 'string' },
-          deliverableId: {
-            type: 'string',
-            description:
-              'Optional provenance tag linking this view to the sub-agent finding it draws from. A reference only — it does NOT display that file; you always author the payload yourself.',
-          },
         },
         required: ['kind', 'payload'],
         additionalProperties: false,

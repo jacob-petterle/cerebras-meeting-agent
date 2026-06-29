@@ -10,7 +10,6 @@ export async function runShareScreen(
     kind: args.kind,
     payload: args.payload,
     ...(args.title !== undefined ? { title: args.title } : {}),
-    ...(args.deliverableId !== undefined ? { deliverableId: args.deliverableId } : {}),
   };
   await deps.display.render(cmd);
 }

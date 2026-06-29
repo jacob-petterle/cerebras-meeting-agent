@@ -1,14 +1,11 @@
-import { readFileSync } from 'node:fs';
 import {
   type CallAgentArgs,
   type DeliverableRecord,
   type SenderKind,
-  type ShareScreenArgs,
   type ToolCall,
   TOOL_ARGS,
 } from '@meeting-agent/protocol';
 import type { Ports } from '../ports';
-import type { AppendLog } from '../resources';
 import { assertNever } from '../../lib/assert-never';
 import { runSpeak, type TtsFn, type TtsResult } from './speak';
 import { runShareScreen } from './shareScreen';
@@ -42,53 +39,10 @@ export interface RegistryDeps {
   tts: TtsFn;
   /** Returns the findings deliverable, or `null` when the research produced none (no fallbacks). */
   callAgent: (args: CallAgentArgs) => Promise<DeliverableRecord | null>;
-  /**
-   * The deliverables log, for resolving `share_screen { deliverableId }` to the actual sub-agent
-   * findings file server-side. Optional: when omitted (e.g. unit tests that don't exercise this),
-   * `share_screen` renders the model's payload verbatim — the prior behavior.
-   */
-  deliverables?: AppendLog<DeliverableRecord>;
-  /**
-   * Reads a deliverable's file by path (injected so tests don't touch the disk). Defaults to a
-   * UTF-8 `readFileSync`. Only used when `deliverables` is set and the id resolves to a `filePath`.
-   */
-  readFile?: (path: string) => string;
 }
 
 export interface ToolRegistry {
   dispatch(call: ToolCall): Promise<TurnOutcome | null>;
-}
-
-/** Default file reader for resolved deliverables — UTF-8, always returns a string. */
-function defaultReadFile(path: string): string {
-  return readFileSync(path, 'utf-8');
-}
-
-/**
- * Resolve a `share_screen` to a render payload. When the call carries a `deliverableId` that maps to
- * a deliverable with a `filePath`, we read that file and render its REAL contents as `html` — so a
- * shared sub-agent result shows the actual findings, not a re-summarized payload the model invented.
- * Defensive: any miss (no id, unknown id, no filePath, unreadable file) falls back to the model's
- * own `kind`/`payload`. Never throws.
- */
-function resolveShareScreenArgs(
-  args: ShareScreenArgs,
-  deliverables: AppendLog<DeliverableRecord> | undefined,
-  readFile: (path: string) => string,
-): ShareScreenArgs {
-  if (!deliverables || args.deliverableId === undefined) return args;
-  const match = deliverables.snapshot().find((e) => e.data.id === args.deliverableId);
-  const filePath = match?.data.filePath;
-  if (!filePath) return args;
-  try {
-    const contents = readFile(filePath);
-    if (contents.trim().length === 0) return args;
-    /** Override with the real file as html; keep the title/id so the stage labels it the same. */
-    return { ...args, kind: 'html', payload: contents };
-  } catch {
-    /** Unreadable file → fall back to the model's payload (current behavior). */
-    return args;
-  }
 }
 
 export function createRegistry(deps: RegistryDeps): ToolRegistry {
@@ -107,9 +61,7 @@ export function createRegistry(deps: RegistryDeps): ToolRegistry {
           return { senderKind: 'agent', text: args.text };
         }
         case 'share_screen': {
-          const parsed = TOOL_ARGS.share_screen.parse(call.args);
-          /** Swap in the real deliverable file contents when the call references one (Task C). */
-          const args = resolveShareScreenArgs(parsed, deps.deliverables, deps.readFile ?? defaultReadFile);
+          const args = TOOL_ARGS.share_screen.parse(call.args);
           await runShareScreen(args, { display: deps.ports.display });
           const label = args.title ?? args.kind;
           return { senderKind: 'tool', text: `shared a ${args.kind}: ${label}` };

@@ -102,8 +102,8 @@ function MermaidView({ payload, pluginData }: { payload: string; pluginData: Rec
 
 function StageContent({ cmd }: { cmd: RenderCommand }): ReactNode {
   const pluginData = useMemo<Record<string, unknown>>(
-    () => ({ kind: cmd.kind, title: cmd.title ?? null, deliverableId: cmd.deliverableId ?? null }),
-    [cmd.kind, cmd.title, cmd.deliverableId],
+    () => ({ kind: cmd.kind, title: cmd.title ?? null }),
+    [cmd.kind, cmd.title],
   );
 
   switch (cmd.kind) {

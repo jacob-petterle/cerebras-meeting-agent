@@ -41,13 +41,13 @@ describe('toDecision (bias to no_op on anything off-contract)', () => {
     expect(d).toEqual({ name: 'speak', args: { text: 'hello' } });
   });
 
-  it('a valid share_screen call keeps its optional fields (deliverableId)', () => {
+  it('a valid share_screen call keeps its optional fields (title)', () => {
     const d = toDecision(
-      call({ name: 'share_screen', arguments: '{"kind":"json","payload":"{}","deliverableId":"d1"}' }),
+      call({ name: 'share_screen', arguments: '{"kind":"json","payload":"{}","title":"Demo"}' }),
     );
     expect(d).toEqual({
       name: 'share_screen',
-      args: { kind: 'json', payload: '{}', deliverableId: 'd1' },
+      args: { kind: 'json', payload: '{}', title: 'Demo' },
     });
   });
 
