@@ -66,7 +66,14 @@ add_executable(zoomsdk src/main.cpp
 )
 
 target_include_directories(zoomsdk PRIVATE ${JWT_CPP_INCLUDE_DIRS} ${PICOJSON_INCLUDE_DIRS})
-target_link_libraries(zoomsdk PRIVATE meetingsdk OpenSSL::SSL OpenSSL::Crypto CLI11::CLI11 PkgConfig::deps ${OpenCV_LIBS} ${X11_LIBRARIES})
+# ${X11_Xext_LIB} provides libXext (XShm) for the stage-capture path; it's also
+# usually pulled in by ${X11_LIBRARIES}, but list it explicitly to be safe.
+target_link_libraries(zoomsdk PRIVATE meetingsdk OpenSSL::SSL OpenSSL::Crypto CLI11::CLI11 PkgConfig::deps ${OpenCV_LIBS} ${X11_LIBRARIES} ${X11_Xext_LIB})
+
+# Standalone capture-proof tool (no Zoom SDK): grabs the Xvfb root via XShm and
+# writes a PNG. See bin/entry.sh STAGE_SELFTEST.
+add_executable(shmcap_test src/tools/shmcap_test.cpp)
+target_link_libraries(shmcap_test PRIVATE ${OpenCV_LIBS} ${X11_LIBRARIES} ${X11_Xext_LIB})
 
 
 

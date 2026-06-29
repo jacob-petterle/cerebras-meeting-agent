@@ -3,15 +3,54 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <vector>
 
+// X11 / XShm headers are included LAST so Xlib's macros (None/Bool/True/False)
+// can't retroactively break the already-parsed OpenCV/SDK headers. All Xlib
+// types stay inside this translation unit, behind the opaque XShmCapture.
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+
+// Opaque XShm capture state declared (forward) in the header.
+struct ZoomSDKShareSource::XShmCapture {
+    Display* display{nullptr};
+    Window root{0};
+    XImage* image{nullptr};
+    XShmSegmentInfo shm{};
+    int width{0};
+    int height{0};
+};
+
+namespace {
+    string toLower(string s) {
+        transform(s.begin(), s.end(), s.begin(),
+                  [](unsigned char c) { return static_cast<char>(tolower(c)); });
+        return s;
+    }
+}
+
 ZoomSDKShareSource::ZoomSDKShareSource(int width, int height, int fps, string textPath)
-    : m_width(width), m_height(height), m_fps(fps > 0 ? fps : 8),
-      m_textPath(move(textPath)) {}
+    : m_width(width), m_height(height), m_fps(fps > 0 ? fps : 10),
+      m_textPath(move(textPath)) {
+    // SHARE_MODE=stage (default) | text. Anything other than "text" is treated
+    // as stage so a typo errs toward the live web stage.
+    const char* modeEnv = getenv("SHARE_MODE");
+    const string modeStr = modeEnv ? toLower(modeEnv) : "stage";
+    m_mode = (modeStr == "text") ? Mode::Text : Mode::Stage;
+
+    // The Xvfb display Chromium draws on; matches entry.sh (DISPLAY=:99).
+    const char* disp = getenv("DISPLAY");
+    m_display = (disp && *disp) ? disp : ":99";
+}
 
 ZoomSDKShareSource::~ZoomSDKShareSource() {
     stop();
@@ -59,6 +98,147 @@ void ZoomSDKShareSource::stop() {
 
     m_shareSender = nullptr;
 }
+
+// ---------------------------------------------------------------------------
+// Stage capture (XShm grab of the Xvfb root window)
+// ---------------------------------------------------------------------------
+
+bool ZoomSDKShareSource::initCapture() {
+    // Runs on the producer thread, so every Xlib call below is single-threaded.
+    auto* cap = new XShmCapture();
+
+    cap->display = XOpenDisplay(m_display.c_str());
+    if (!cap->display) {
+        Log::error("stage capture: cannot open X display " + m_display);
+        delete cap;
+        return false;
+    }
+
+    if (!XShmQueryExtension(cap->display)) {
+        Log::error("stage capture: MIT-SHM extension unavailable on " + m_display);
+        XCloseDisplay(cap->display);
+        delete cap;
+        return false;
+    }
+
+    const int screen = DefaultScreen(cap->display);
+    cap->root = RootWindow(cap->display, screen);
+
+    XWindowAttributes attr;
+    if (!XGetWindowAttributes(cap->display, cap->root, &attr)) {
+        Log::error("stage capture: XGetWindowAttributes failed");
+        XCloseDisplay(cap->display);
+        delete cap;
+        return false;
+    }
+    cap->width = attr.width;
+    cap->height = attr.height;
+
+    // One persistent shared-memory XImage reused for every grab (no per-frame
+    // alloc). Created from the root's own visual/depth so XShmGetImage matches.
+    cap->image = XShmCreateImage(cap->display, attr.visual, attr.depth, ZPixmap,
+                                 nullptr, &cap->shm, cap->width, cap->height);
+    if (!cap->image) {
+        Log::error("stage capture: XShmCreateImage failed");
+        XCloseDisplay(cap->display);
+        delete cap;
+        return false;
+    }
+
+    cap->shm.shmid = shmget(IPC_PRIVATE,
+                            static_cast<size_t>(cap->image->bytes_per_line) * cap->image->height,
+                            IPC_CREAT | 0600);
+    if (cap->shm.shmid < 0) {
+        Log::error("stage capture: shmget failed");
+        XDestroyImage(cap->image);
+        XCloseDisplay(cap->display);
+        delete cap;
+        return false;
+    }
+
+    cap->shm.shmaddr = static_cast<char*>(shmat(cap->shm.shmid, nullptr, 0));
+    if (cap->shm.shmaddr == reinterpret_cast<char*>(-1)) {
+        Log::error("stage capture: shmat failed");
+        shmctl(cap->shm.shmid, IPC_RMID, nullptr);
+        XDestroyImage(cap->image);
+        XCloseDisplay(cap->display);
+        delete cap;
+        return false;
+    }
+    cap->image->data = cap->shm.shmaddr;
+    cap->shm.readOnly = False;
+
+    if (!XShmAttach(cap->display, &cap->shm)) {
+        Log::error("stage capture: XShmAttach failed");
+        shmdt(cap->shm.shmaddr);
+        shmctl(cap->shm.shmid, IPC_RMID, nullptr);
+        cap->image->data = nullptr;
+        XDestroyImage(cap->image);
+        XCloseDisplay(cap->display);
+        delete cap;
+        return false;
+    }
+    XSync(cap->display, False);
+
+    // Mark the segment for removal now; it's freed once we detach / exit, so a
+    // crash can't leak the SysV shm segment.
+    shmctl(cap->shm.shmid, IPC_RMID, nullptr);
+
+    m_capture = cap;
+    return true;
+}
+
+void ZoomSDKShareSource::teardownCapture() {
+    if (!m_capture)
+        return;
+
+    auto* cap = m_capture;
+    m_capture = nullptr;
+
+    if (cap->display) {
+        XShmDetach(cap->display, &cap->shm);
+        XSync(cap->display, False);
+    }
+    if (cap->image) {
+        // data points at shared memory, not malloc'd — null it so XDestroyImage
+        // doesn't free() a shm address.
+        cap->image->data = nullptr;
+        XDestroyImage(cap->image);
+    }
+    if (cap->shm.shmaddr && cap->shm.shmaddr != reinterpret_cast<char*>(-1))
+        shmdt(cap->shm.shmaddr);
+    if (cap->display)
+        XCloseDisplay(cap->display);
+
+    delete cap;
+}
+
+bool ZoomSDKShareSource::captureFrame(cv::Mat& outBgr) {
+    if (!m_capture)
+        return false;
+
+    auto* cap = m_capture;
+    if (!XShmGetImage(cap->display, cap->root, cap->image, 0, 0, AllPlanes))
+        return false;
+
+    // Xvfb's depth-24 root is 32bpp BGRX in memory; wrap it zero-copy (honoring
+    // the stride) then drop alpha and scale to the share resolution if needed.
+    cv::Mat bgra(cap->height, cap->width, CV_8UC4,
+                 cap->image->data, cap->image->bytes_per_line);
+
+    cv::Mat bgr;
+    cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+    if (cap->width != m_width || cap->height != m_height)
+        cv::resize(bgr, outBgr, cv::Size(m_width, m_height), 0, 0, cv::INTER_AREA);
+    else
+        outBgr = bgr;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Text rendering (fallback / SHARE_MODE=text)
+// ---------------------------------------------------------------------------
 
 string ZoomSDKShareSource::readShareText() const {
     // Best-effort read every frame. The Mac writes this file atomically
@@ -205,6 +385,10 @@ cv::Mat ZoomSDKShareSource::renderFrame(const string& text, uint64_t frameNumber
     return bgr;
 }
 
+// ---------------------------------------------------------------------------
+// Producer loop
+// ---------------------------------------------------------------------------
+
 void ZoomSDKShareSource::produceFrames() {
     using namespace std::chrono;
 
@@ -212,10 +396,24 @@ void ZoomSDKShareSource::produceFrames() {
     const auto frameInterval = duration_cast<steady_clock::duration>(duration<double>(1.0 / m_fps));
     const int frameLength = m_width * m_height * 3 / 2;  // packed I420 length
 
+    // In stage mode, try to bring up XShm capture once. If it fails we degrade
+    // to the text renderer rather than sending nothing (the documented
+    // "always show something" fallback).
+    bool captureOk = false;
+    if (m_mode == Mode::Stage) {
+        captureOk = initCapture();
+        if (captureOk)
+            Log::success("share producer: stage capture via XShm on " + m_display);
+        else
+            Log::error("share producer: stage capture unavailable, falling back to text (" + m_textPath + ")");
+    }
+
+    const string modeLabel = (m_mode == Mode::Stage && captureOk) ? "stage" : "text";
     Log::info("share producer: " + std::to_string(m_width) + "x" + std::to_string(m_height) +
-              " @ " + std::to_string(m_fps) + " fps, text=" + m_textPath);
+              " @ " + std::to_string(m_fps) + " fps, mode=" + modeLabel);
 
     uint64_t frameNumber = 0;
+    bool warnedCaptureFail = false;
     auto nextFrame = start;
 
     cv::Mat i420;  // reused across iterations
@@ -223,8 +421,21 @@ void ZoomSDKShareSource::produceFrames() {
     while (m_isSending.load()) {
         const double elapsed = duration<double>(steady_clock::now() - start).count();
 
-        const string text = readShareText();
-        cv::Mat bgr = renderFrame(text, frameNumber, elapsed);
+        cv::Mat bgr;
+        bool haveFrame = false;
+        if (captureOk) {
+            haveFrame = captureFrame(bgr);
+            if (!haveFrame && !warnedCaptureFail) {
+                Log::error("share producer: XShmGetImage failed; rendering text for affected frames");
+                warnedCaptureFail = true;
+            }
+        }
+
+        if (!haveFrame) {
+            const string text = readShareText();
+            bgr = renderFrame(text, frameNumber, elapsed);
+        }
+
         cv::cvtColor(bgr, i420, cv::COLOR_BGR2YUV_I420);  // contiguous I420, len = w*h*3/2
 
         if (m_shareSender) {
@@ -246,6 +457,8 @@ void ZoomSDKShareSource::produceFrames() {
         nextFrame += frameInterval;
         std::this_thread::sleep_until(nextFrame);
     }
+
+    teardownCapture();
 
     Log::info("share producer: stopped after " + std::to_string(frameNumber) + " frames");
 }

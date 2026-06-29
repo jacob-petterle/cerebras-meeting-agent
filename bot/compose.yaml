@@ -2,6 +2,18 @@ services:
   zoomsdk: &zoomsdk
     build: ./
     platform: linux/amd64
+    # Portable host.docker.internal: works on Docker Desktop for Mac for free,
+    # and this makes the same hostname resolve on plain Linux Docker too. The
+    # container Chromium loads the stage page from the Mac via this name.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Stage page the headed Chromium loads (the Mac-served web stage). Default
+      # points at the team's `packages/web` Vite dev server on the host.
+      - STAGE_URL=${STAGE_URL:-http://host.docker.internal:5173}
+      # Screen-share frame source: stage (capture Chromium on Xvfb) | text
+      # (render out/share_text.txt). entry.sh skips launching Chromium for text.
+      - SHARE_MODE=${SHARE_MODE:-stage}
     volumes:
      - .:/tmp/meeting-sdk-linux-sample
     ports:

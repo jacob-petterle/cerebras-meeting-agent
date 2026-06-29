@@ -28,6 +28,7 @@ RUN apt-get update  \
     libssl-dev \
     libx11-dev \
     libx11-xcb1 \
+    libxext-dev \
     libxcb-image0 \
     libxcb-keysyms1 \
     libxcb-randr0 \
@@ -50,6 +51,28 @@ RUN apt-get install -y libasound2t64 libasound2-plugins alsa alsa-utils alsa-oss
 
 # Install Pulseaudio
 RUN apt-get install -y  pulseaudio pulseaudio-utils
+
+# Stage-page screen share: a virtual X display (Xvfb) for a headed Chromium to
+# draw on, the X utils we poll for readiness, the Xext dev package for the XShm
+# capture path, and fonts so rendered text/emoji aren't tofu.
+RUN apt-get install -y \
+    xvfb \
+    x11-utils \
+    fonts-liberation \
+    fonts-noto-color-emoji
+
+# Install Google Chrome (google-chrome-stable) from Google's own apt repo.
+# NOTE: do NOT use Ubuntu's `chromium` — on 24.04 it's a transitional package
+# that pulls the Chromium *snap*, which does not run inside Docker. Google ships
+# amd64 only, which is fine: this image is pinned linux/amd64 (Rosetta on Apple
+# Silicon) because the Meeting SDK is x86_64-only.
+RUN apt-get install -y gnupg \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+       | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+       > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable
 
 FROM base AS deps
 
