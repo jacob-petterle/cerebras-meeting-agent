@@ -463,6 +463,38 @@ h3 {
   color: var(--accent);
 }
 
+/* Brain-beat rows in the Brain tab: a heartbeat decision woven into the conversation.
+   Accented inset so it reads as "the brain decided," not "someone spoke." Muted for no_op. */
+.turn[data-kind="brain"] {
+  border-left: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+}
+.turn[data-kind="brain"] .who {
+  color: var(--accent);
+}
+.turn[data-kind="brain"] .decided {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.turn[data-kind="brain"] .detail {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.turn[data-kind="brain"][data-noop="true"] {
+  border-left-color: var(--faint);
+  background: transparent;
+  opacity: 0.6;
+}
+.turn[data-kind="brain"][data-noop="true"] .who,
+.turn[data-kind="brain"][data-noop="true"] .decided {
+  color: var(--faint);
+}
+
 /* ----------------------------------------------------------- tool feed */
 
 .tool {
