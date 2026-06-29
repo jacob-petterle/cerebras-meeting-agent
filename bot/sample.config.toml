@@ -1,0 +1,32 @@
+#### !! Do not store plain text credentials in production environments !!
+#### File Format: https://cliutils.github.io/CLI11/book/chapters/config.html#configure-file-format
+
+# Zoom Meeting SDK Client ID
+client-id=""
+
+# Zoom Meeting SDK Client Secret
+client-secret=""
+
+# Use a join-url or a meeting-id and password
+join-url=""
+
+# --- End-to-end demo (bot speaks + shows): see triage-bot/RUNBOOK.md ---
+# Speak TTS into the meeting via a virtual mic. The Mac streams 32kHz mono s16le
+# PCM to the container on this TCP port; the bot pushes it as its microphone.
+send-audio=true
+audio-send-port=3001        # must match compose.yaml ports + triage-bot [demo].tts_port
+
+# Share the bot's screen as a raw external source. Each frame the bot renders the
+# text in out/share_text.txt (the Mac orchestrator writes the echo there).
+screen-share=true
+
+# Per-speaker raw recording -> out/node-<id>.pcm, consumed by the Mac STT pipeline.
+# (RawAudio requires local-recording privilege, which the host must grant.)
+[RawAudio]
+file="meeting-audio.pcm"
+dir="out"
+separate-participants=true
+
+# Raw video recording (not needed for the demo).
+# [RawVideo]
+# file="meeting-video.mp4"

@@ -1,13 +1,19 @@
+import type { RenderCommand } from '@meeting-agent/protocol';
 import type { DisplayPort } from '../../core/ports';
+import type { WsServerHandle } from '../../ws';
 
 /**
- * Zoom Display adapter — Phase 2. Render command → Chromium/Xvfb framebuffer → Meeting SDK
- * screenshare. Not implemented for the local harness. See ZOOM-SETUP.md (R3 screenshare-send risk).
+ * Zoom Display adapter — and the punchline of the screenshare design: there is nothing Zoom-specific
+ * here. The bot runs a headless Chromium that loads the `packages/web` stage over the SAME WebSocket
+ * the dev browser uses, then screen-shares that window. So a render command reaches the bot's stage
+ * by the identical `ws.broadcastRender` path as the local browser — we never talk to the bot for
+ * display. This mirrors `createDisplayWs`; it exists separately only so the ZOOM wiring in main.ts
+ * reads symmetrically with the other two zoom adapters.
  */
-export function createDisplayShare(): DisplayPort {
+export function createDisplayShare(ws: WsServerHandle): DisplayPort {
   return {
-    async render() {
-      throw new Error('Zoom display adapter not implemented (Phase 2 — see ZOOM-SETUP.md)');
+    async render(cmd: RenderCommand) {
+      ws.broadcastRender(cmd);
     },
   };
 }
