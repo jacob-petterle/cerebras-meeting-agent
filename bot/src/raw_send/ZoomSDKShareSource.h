@@ -103,7 +103,7 @@ private:
     cv::Mat renderFrame(const string& text, uint64_t frameNumber, double elapsedSeconds) const;
 
 public:
-    explicit ZoomSDKShareSource(int width = 1280, int height = 720, int fps = 10,
+    explicit ZoomSDKShareSource(int width = 1280, int height = 720, int fps = 40,
                                 string textPath = "out/share_text.txt");
     ~ZoomSDKShareSource();
 

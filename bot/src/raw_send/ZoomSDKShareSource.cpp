@@ -39,8 +39,16 @@ namespace {
 }
 
 ZoomSDKShareSource::ZoomSDKShareSource(int width, int height, int fps, string textPath)
-    : m_width(width), m_height(height), m_fps(fps > 0 ? fps : 10),
+    : m_width(width), m_height(height), m_fps(fps > 0 ? fps : 40),
       m_textPath(move(textPath)) {
+    // SHARE_FPS env override (1..60). The stage is full-motion (the animated aura
+    // orb), so we want a high, smooth cadence — default 40. Clamp to 60 so a typo
+    // can't peg the CPU under Rosetta; <=0 / non-numeric falls back to the default.
+    if (const char* fpsEnv = getenv("SHARE_FPS")) {
+        const int v = atoi(fpsEnv);
+        if (v > 0 && v <= 60) m_fps = v;
+    }
+
     // SHARE_MODE=stage (default) | text. Anything other than "text" is treated
     // as stage so a typo errs toward the live web stage.
     const char* modeEnv = getenv("SHARE_MODE");

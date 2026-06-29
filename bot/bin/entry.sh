@@ -70,7 +70,12 @@ start-xvfb() {
 # Launch headed (NOT --headless) Chromium in kiosk mode on the Xvfb display so
 # the page actually renders into the framebuffer we capture. --disable-gpu is
 # deliberate: the stage is 2D, and it sidesteps the documented Chromium GPU
-# process death under Rosetta on Apple Silicon.
+# process death under Rosetta on Apple Silicon. BUT --disable-gpu also turns
+# WebGL OFF (getContext('webgl') returns null), which blanks the agent-state
+# aura orb (a WebGL shader) while the rest of the page renders. --enable-unsafe-
+# swiftshader restores WebGL via the software (SwiftShader/ANGLE) path — verified
+# in-container: without it WebGL=NULL, with it WebGL=OK. "unsafe" only means
+# software-rendered (no GPU sandbox guarantees), which is fine for our own stage.
 start-chromium() {
   local url="${1:-$STAGE_URL}"
   echo "launching Chromium (kiosk) on $DISPLAY -> $url"
@@ -78,6 +83,7 @@ start-chromium() {
     --kiosk \
     --no-sandbox \
     --disable-gpu \
+    --enable-unsafe-swiftshader \
     --disable-dev-shm-usage \
     --window-size=1280,720 \
     --window-position=0,0 \

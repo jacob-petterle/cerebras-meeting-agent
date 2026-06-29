@@ -18,6 +18,9 @@ services:
       # Screen-share frame source: stage (capture Chromium on Xvfb) | text
       # (render out/share_text.txt). entry.sh skips launching Chromium for text.
       - SHARE_MODE=${SHARE_MODE:-stage}
+      # Screen-share frame rate (1..60). The stage is full-motion (animated orb), so
+      # default 40 for a smooth share. The producer also lifts Zoom's own FPS cap.
+      - SHARE_FPS=${SHARE_FPS:-40}
     volumes:
      - .:/tmp/meeting-sdk-linux-sample
     ports:

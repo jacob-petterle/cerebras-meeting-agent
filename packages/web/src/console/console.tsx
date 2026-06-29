@@ -27,7 +27,7 @@ const TABS: { key: TabKey; label: string; Icon: IconCmp }[] = [
  * between tabs, the active tab is the only one in the tab order.
  */
 export function Console() {
-  const [active, setActive] = useState<TabKey>('transcript');
+  const [active, setActive] = useState<TabKey>('brain');
   const transcript = useHarnessStore((state) => state.transcript);
   const deliverables = useHarnessStore((state) => state.deliverables);
   const subAgents = useHarnessStore((state) => state.subAgents);
