@@ -52,10 +52,13 @@ setup-pulseaudio() {
 # Start the virtual X server the stage Chromium draws on and the bot captures.
 # Xvfb has no "ready" signal, so poll xdpyinfo until the display answers.
 start-xvfb() {
-  # 960x540x16: half-res 16:9, Zoom recompresses anyway; ~56% fewer pixels than
+  # 960x540: half-res 16:9, Zoom recompresses anyway; ~56% fewer pixels than
   # 1280x720 cuts XShm capture + SwiftShader raster cost proportionally.
-  echo "starting Xvfb on $DISPLAY (960x540x16)"
-  Xvfb "$DISPLAY" -screen 0 960x540x16 -ac -nolisten tcp &> out/xvfb.log &
+  # Depth MUST be 24 (32bpp BGRX): the XShm capture path in ZoomSDKShareSource
+  # wraps the root as CV_8UC4, so a 16-bit framebuffer fails OpenCV's
+  # _step >= minstep assertion (bytes_per_line < width*4) and aborts the bot.
+  echo "starting Xvfb on $DISPLAY (960x540x24)"
+  Xvfb "$DISPLAY" -screen 0 960x540x24 -ac -nolisten tcp &> out/xvfb.log &
 
   for i in {1..50}; do
     if xdpyinfo -display "$DISPLAY" &> /dev/null; then

@@ -38,9 +38,17 @@ public:
     // 20 ms frame = 640 samples = 1280 bytes @ 32 kHz mono s16le.
     static constexpr size_t   c_frameBytes   = 1280;
     static constexpr int      c_frameMillis  = 20;
-    // Bounded jitter buffer (~200 ms) to absorb transport jitter while
-    // capping added latency. 32 kHz * 2 bytes = 64,000 B/s -> 12,800 B = 200 ms.
-    static constexpr size_t   c_maxBufferBytes = 12800;
+    // Bounded jitter buffer. 32 kHz * 2 bytes = 64,000 B/s, so 1 ms = 64 B.
+    // Cap ~600 ms so the brain can run a cushion ahead and bursts aren't dropped;
+    // oldest bytes are still trimmed past this to bound worst-case latency.
+    static constexpr size_t   c_maxBufferBytes = 38400;   // ~600 ms
+    // PRE-FILL (low-watermark): once primed we emit real audio, but after the
+    // buffer runs dry we re-prime — holding silence until ~120 ms is buffered —
+    // instead of dribbling silence frame-by-frame. This cushion absorbs delivery
+    // jitter (loaded brain event loop + Rosetta CPU contention) that otherwise
+    // underran the old zero-cushion buffer and dropped the agent's voice to
+    // silence mid-utterance. ~120 ms = 6 frames = 7,680 B.
+    static constexpr size_t   c_prefillBytes = 7680;       // ~120 ms
 
     ZoomSDKVirtualAudioMicEvent() = default;
     ~ZoomSDKVirtualAudioMicEvent();
@@ -64,7 +72,9 @@ public:
 private:
     void senderLoop();
 
-    // Pop exactly c_frameBytes into out, zero-padding (silence) on underrun.
+    // Fill exactly c_frameBytes into out. Honors the pre-fill gate: emits silence
+    // while priming (until c_prefillBytes buffered), then real audio; on a dry
+    // buffer it re-arms priming. Zero-pads any partial underrun frame.
     void popFrame(char* out, size_t len);
 
     // Set by the SDK thread (onMicInitialize/onMicUninitialized), read by the
@@ -82,6 +92,10 @@ private:
 
     mutex        m_bufMutex;
     deque<char>  m_pcm;              // 32 kHz mono s16le jitter buffer
+    // Playback state under m_bufMutex: false = priming (emit silence until the
+    // pre-fill cushion is buffered), true = draining real audio. Starts priming;
+    // re-armed to false whenever the buffer runs dry (see popFrame).
+    bool         m_playing = false;
 };
 
 #endif //MEETINGSDK_HEADLESS_LINUX_SAMPLE_ZOOMSDKVIRTUALAUDIOMICEVENT_H
