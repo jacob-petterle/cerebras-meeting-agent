@@ -57,6 +57,10 @@ export function fetchOlder(resource: ResourceName, beforeSeqNo: number, limit: n
 
 /** Clear the session: the server wipes its logs + brain cursor, then broadcasts a reset to all clients. */
 export function sendReset(): void {
+  // Clear the local view IMMEDIATELY so the button is always responsive even if the server's reset
+  // echo is delayed or the socket is mid-reconnect. The server still wipes its logs + broadcasts a
+  // reset (which re-clears, harmlessly) so the wipe is durable across reconnects.
+  useHarnessStore.getState().resetAll();
   send({ type: 'reset' });
 }
 

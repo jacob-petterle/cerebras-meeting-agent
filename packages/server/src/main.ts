@@ -1,4 +1,5 @@
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
 import { createResources } from './core/resources';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, type Decision } from './core/decide';
@@ -42,6 +43,13 @@ const BOT_TTS_PORT = Number(process.env.BOT_TTS_PORT ?? 3001);
 const EXCLUDE_NODE_ID = process.env.EXCLUDE_NODE_ID || undefined;
 /** Verbose per-frame pipeline logging (high-frequency). Off by default; `DEBUG_PIPE=1` to enable. */
 const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
+/**
+ * Where the Cursor research sub-agent runs. Default = the HOME directory so it can read ANY repo on
+ * the machine (e.g. ~/repos/shipyard) — not just this one. Starting it in the meeting-agent repo
+ * (process.cwd()) is why "investigate the Shipyard codebase" timed out: it couldn't see those files.
+ * Override with CURSOR_AGENT_CWD (e.g. point it at ~/repos for a tighter scope).
+ */
+const CURSOR_AGENT_CWD = process.env.CURSOR_AGENT_CWD || homedir();
 const SESSION_CONTEXT =
   process.env.SESSION_CONTEXT ??
   'A local test session. One human participant ("me") is speaking into a microphone. No specific project is in scope yet — be a generally helpful collaborator.';
@@ -211,14 +219,16 @@ async function main(): Promise<void> {
           deliverables: resources.deliverables,
           outDir: '.deliverables',
           apiKey: cursorKey,
-          cwd: process.cwd(),
+          cwd: CURSOR_AGENT_CWD,
           onProgress: (l) => console.log(l),
         })
       : createCallAgentMock({
           deliverables: resources.deliverables,
           outDir: '.deliverables',
         });
-    console.log(`[main] call_agent: ${cursorKey ? 'real Cursor SDK' : 'mock'}`);
+    console.log(
+      `[main] call_agent: ${cursorKey ? `real Cursor SDK (cwd=${CURSOR_AGENT_CWD})` : 'mock'}`,
+    );
     const registry = createRegistry({
       ports,
       tts: (text) => tts.synthesize(text),
