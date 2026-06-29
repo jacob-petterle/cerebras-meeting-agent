@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Console } from './console/console';
 import { IconActivity, IconMic, IconMicOff, IconOffline, IconReset } from './lib/icons';
 import { formatUptime } from './lib/format';
-import { startMic, stopMic } from './mic';
+import { resumeMicContext, startMic, stopMic } from './mic';
 import { Stage } from './stage/stage';
 import { useHarnessStore } from './store';
 import { resolveWsUrl, sendReset } from './ws';
@@ -131,17 +131,37 @@ function resolveStageOnly(): boolean {
   return !debugEnv;
 }
 
+/**
+ * The chrome-less screenshare surface (non-debug default). There's no mic button here, so we
+ * AUTO-START capture on mount — otherwise the agent can't hear anything. Best-effort: getUserMedia
+ * streams when permitted; the capture AudioContext may start suspended under the autoplay policy, so
+ * we also resume it on the first user gesture. The Zoom bot's Chromium (launched with autoplay flags)
+ * gets it without a gesture; a normal browser may need one interaction.
+ */
+function StageOnlyView() {
+  useEffect(() => {
+    void startMic().catch((err) => console.warn('[stage] mic auto-start:', err));
+    const resume = () => resumeMicContext();
+    window.addEventListener('pointerdown', resume);
+    window.addEventListener('keydown', resume);
+    return () => {
+      window.removeEventListener('pointerdown', resume);
+      window.removeEventListener('keydown', resume);
+      stopMic();
+    };
+  }, []);
+  return (
+    <div className="stage-only">
+      <Stage minimal />
+    </div>
+  );
+}
+
 export function App() {
   // Default render is the screenshare surface (no chrome): just the agent-state aurora when nothing is
   // shared, the deliverable + an aurora PIP when it is. The full operator console is debug-gated — see
   // resolveStageOnly. `?view=stage` is kept as an explicit force for the Zoom bot.
-  if (resolveStageOnly()) {
-    return (
-      <div className="stage-only">
-        <Stage minimal />
-      </div>
-    );
-  }
+  if (resolveStageOnly()) return <StageOnlyView />;
 
   return (
     <div className="app">

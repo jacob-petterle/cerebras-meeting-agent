@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -12,6 +13,8 @@ import {
 } from '@meeting-agent/protocol';
 import { buildSystemPrompt } from './identity';
 import type { AppendLog } from './resources';
+import type { ActiveShare } from './screen-state';
+import { ageOf, quantizeNow } from './time';
 import type { AssembledResult, AssembledToolCall, CerebrasClient } from './cerebras';
 
 /**
@@ -31,6 +34,13 @@ import type { AssembledResult, AssembledToolCall, CerebrasClient } from './cereb
 
 /** Cap how many of the most-recent deliverables are folded into the loop, to keep the prompt lean. */
 const MAX_DELIVERABLES_IN_CONTEXT = 8;
+
+/**
+ * Per-deliverable safety cap on the inlined findings markdown (chars). The sub-agent is told to be terse,
+ * so a normal findings doc sits well under this — the cap only guards against a runaway agent ballooning
+ * every beat's prompt. Past it we truncate and point at the on-disk file rather than drop the finding.
+ */
+const DELIVERABLE_CONTENT_MAX = 12_000;
 
 /** Cap how many of the most-recent sub-agent tasks (latest-per-id) are folded into the loop. */
 const MAX_SUB_AGENTS_IN_CONTEXT = 8;
@@ -53,7 +63,7 @@ export interface Decision {
   args: unknown;
 }
 
-/** Hand-written JSON-schemas for the 4 tools (zod-to-json-schema avoided to keep deps lean). */
+/** Hand-written JSON-schemas for the 5 tools (zod-to-json-schema avoided to keep deps lean). */
 export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
@@ -74,7 +84,7 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
     function: {
       name: 'share_screen',
       description:
-        'Put an artifact on the shared screen. Use when a visual conveys it better than speech, or to show a sub-agent result.',
+        'Put an artifact YOU authored on the shared screen — compose what is shown from what you know or what your agents found. Do NOT forward a sub-agent findings file; that file is for you to read, and you re-express what matters here. Use when a visual conveys something better than speech.',
       parameters: {
         type: 'object',
         properties: {
@@ -89,7 +99,8 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
           title: { type: 'string' },
           deliverableId: {
             type: 'string',
-            description: 'Optional id of a sub-agent deliverable this artifact corresponds to.',
+            description:
+              'Optional provenance tag linking this view to the sub-agent finding it draws from. A reference only — it does NOT display that file; you always author the payload yourself.',
           },
         },
         required: ['kind', 'payload'],
@@ -102,7 +113,7 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
     function: {
       name: 'call_agent',
       description:
-        'Hand a well-scoped investigation to your always-on research assistant — a very smart partner who is always looking things up for you, reading code, querying data, producing a findings document — so YOU can keep participating while it digs. Dispatch deliberately, not eagerly: only when there is a genuine, specific need that truly requires digging (not something you can answer directly, and not trivial). Gather enough context first and batch it into one clear task. It runs in the background for a while and reports back as a deliverable. NEVER dispatch a task that already appears as status=running in <sub_agents> — it is already in flight.',
+        'Hand a self-contained investigation brief to one of your research agents — a capable coding agent loose in the repo that reads code, queries data, and writes back a markdown findings doc YOU read, all while you keep participating. It runs OUT OF BAND in the background (depth is fine; it never blocks you). Dispatch deliberately, not eagerly: only for a genuine, specific need that truly requires digging — not something you can answer directly, and not trivial. The agent CANNOT hear the room and knows ONLY what this task says, so write it as a COMPLETE brief: the precise question, the context/names/paths it cannot see, the scope boundary, whether it is a wide map or a deep dive, and the grounding bar (cite file:line, real counts). Go WIDE first (one breadth task that maps and counts), then fan out NARROW deep-dive tasks as findings come back — prefer several focused agents over one "investigate everything" task. NEVER dispatch a task already shown as status=running in <sub_agents>; it is already in flight.',
       parameters: {
         type: 'object',
         properties: {
@@ -130,6 +141,23 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'sleep',
+      description:
+        'Deliberately step back for a stretch: end your turn AND pause your idle heartbeat for `seconds`, so you are not re-prompted every beat while you have nothing to add. Use it when you want to stand down for a bit — e.g. you just put a diagram up and want to let it sit, or the room is quiet and self-checking would only be noise. A person speaking (or a research result landing) wakes you early. Use no_op to yield a single beat; use sleep to stand down for a few seconds up to ~2 minutes.',
+      parameters: {
+        type: 'object',
+        properties: {
+          seconds: { type: 'number', description: 'How long to stand down (clamped to ~2–120s).' },
+          reason: { type: 'string' },
+        },
+        required: ['seconds'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 /** Narrow an arbitrary string to a ToolName without an assertion (used after the `in` guard). */
@@ -141,6 +169,8 @@ function toToolName(name: string): ToolName {
       return 'share_screen';
     case 'call_agent':
       return 'call_agent';
+    case 'sleep':
+      return 'sleep';
     default:
       return 'no_op';
   }
@@ -187,10 +217,11 @@ export function decisionFromResult(result: AssembledResult): Decision {
  * emitters here never drift. Mirrors Shipyard's `apps/daemon/src/shared/xml-tag-names.ts`.
  */
 const XML_TAGS = {
-  TRANSCRIPT: 'transcript',
+  MEETING: 'meeting',
+  CONVERSATION: 'conversation',
+  SCREEN: 'screen',
   DELIVERABLES: 'deliverables',
   SUB_AGENTS: 'sub_agents',
-  CURRENT_TIME: 'current-time',
 } as const;
 
 /** Escape text/attribute content so an utterance can never break out of its XML envelope. */
@@ -217,11 +248,12 @@ function xmlEscape(s: string): string {
  * Bounded to the most-recent {@link MAX_TRANSCRIPT_IN_CONTEXT} utterances so the prompt stays sane on
  * a long session; the cap is surfaced on the envelope so the model knows older lines may be elided.
  */
-export function renderTranscriptResource(
+export function renderConversationResource(
   entries: LogEntry<TranscriptEntry>[],
   newSinceSeqNo: number,
+  now: number = Date.now(),
 ): string {
-  const T = XML_TAGS.TRANSCRIPT;
+  const T = XML_TAGS.CONVERSATION;
   if (entries.length === 0) {
     return `<${T} note="the conversation is empty so far" />`;
   }
@@ -231,37 +263,117 @@ export function renderTranscriptResource(
     .map((e) => {
       /** Mark utterances new since the last beat so the model knows what to consider acting on. */
       const isNew = e.seqNo >= newSinceSeqNo ? ' new="true"' : '';
-      return `  <utterance speaker="${xmlEscape(e.data.participantId)}" kind="${e.data.senderKind}" ts="${e.data.timestamp}"${isNew}>${xmlEscape(e.data.text)}</utterance>`;
+      /** A human-readable AGE relative to this beat's `now` — the model can't reason about epoch ms. */
+      const age = ageOf(e.data.timestamp, now);
+      return `  <utterance speaker="${xmlEscape(e.data.participantId)}" kind="${e.data.senderKind}" age="${age}"${isNew}>${xmlEscape(e.data.text)}</utterance>`;
     })
     .join('\n');
   const cap = elided > 0 ? ` showing-last="${capped.length}" elided-older="${elided}"` : '';
   return (
-    `<${T} new-since="${newSinceSeqNo}"${cap} note="the full conversation so far, live room audio transcribed — the speakers are talking to each other, not to you; utterances tagged as new arrived since you last observed, act only on those">\n` +
+    `<${T} new-since="${newSinceSeqNo}"${cap} note="the full conversation so far, live room audio transcribed — the speakers are talking to each other, not to you; utterances tagged as new arrived since you last observed, act only on those; age is how long ago each was said">\n` +
     lines +
     `\n</${T}>`
   );
 }
 
 /**
- * Render the current sub-agent deliverables as an observed resource block (bounded to the most
- * recent few). This is what lets the model choose to `share_screen` a result by its `deliverableId`.
+ * Render the shared SCREEN as an observed resource (inside <meeting>). This is what lets the model
+ * reason about "how long to keep a diagram up": it sees what's currently shown and for how long.
+ * `mine` is the honesty bit — true when WE put it up (the model can trust its artifact is visible),
+ * false when another participant is presenting (the model must NOT assume its own artifact is on screen).
  */
-export function renderDeliverablesResource(items: LogEntry<DeliverableRecord>[]): string {
+export function renderScreenResource(screen: ActiveShare | null, now: number): string {
+  const S = XML_TAGS.SCREEN;
+  if (!screen) {
+    return `<${S} note="nothing is on the shared screen right now" />`;
+  }
+  const age = ageOf(screen.since, now);
+  if (!screen.mine) {
+    return `<${S} showing="${xmlEscape(screen.label)}" mine="false" since="${age}" note="another participant is presenting — your last artifact is NOT what is on screen" />`;
+  }
+  const kindAttr = screen.kind ? ` kind="${xmlEscape(screen.kind)}"` : '';
+  return `<${S} showing="${xmlEscape(screen.label)}"${kindAttr} mine="true" up-for="${age}" note="this is what YOU put on the shared screen; a later share_screen replaces it — keep it up while relevant, refresh it as the discussion moves, clear it when it no longer fits" />`;
+}
+
+/**
+ * The <meeting> envelope — the live meeting as ONE resource with two channels: what's being SAID
+ * (<conversation>) and what's being SHOWN (<screen>). Mirrors how Shipyard wraps shared state. Carries
+ * the beat's authoritative `now` (quantized to 5s so it holds steady between beats), `elapsed` (how long
+ * the meeting has run), and `room-quiet-for` (how long since a PERSON last spoke — the key pacing signal:
+ * a lull is the moment to act, take a stale diagram down, or sleep). The agent's own workshop
+ * (<sub_agents>, <deliverables>) stays OUTSIDE this envelope — that's its side, not the room's.
+ */
+export function renderMeetingResource(args: {
+  transcript: LogEntry<TranscriptEntry>[];
+  newSinceSeqNo: number;
+  screen: ActiveShare | null;
+  now: number;
+}): string {
+  const M = XML_TAGS.MEETING;
+  const nowIso = new Date(quantizeNow(args.now)).toISOString();
+  const firstHuman = args.transcript.find((e) => e.data.senderKind === 'human');
+  const lastHuman = [...args.transcript].reverse().find((e) => e.data.senderKind === 'human');
+  const elapsed = firstHuman ? ` elapsed="${ageOf(firstHuman.data.timestamp, args.now)}"` : '';
+  const quiet = lastHuman ? ` room-quiet-for="${ageOf(lastHuman.data.timestamp, args.now)}"` : '';
+  const conversation = renderConversationResource(args.transcript, args.newSinceSeqNo, args.now);
+  const screen = renderScreenResource(args.screen, args.now);
+  return (
+    `<${M} now="${nowIso}"${elapsed}${quiet} note="the live meeting — what's being SAID (conversation) and SHOWN (screen); time is RELATIVE: an age like &quot;40s ago&quot; or &quot;just now&quot;, gaps under ~2s read as simultaneous">\n` +
+    `${conversation}\n${screen}\n` +
+    `</${M}>`
+  );
+}
+
+/**
+ * Read a deliverable's findings file for inlining into the resource — the markdown the brain READS (it
+ * is never displayed). Returns null when there is no file, it's empty, or it can't be read; past the
+ * size cap it truncates and points at the on-disk path so the finding is never silently dropped.
+ */
+function readDeliverableContent(filePath: string | null): string | null {
+  if (!filePath) return null;
+  try {
+    const text = readFileSync(filePath, 'utf-8');
+    if (text.trim().length === 0) return null;
+    return text.length > DELIVERABLE_CONTENT_MAX
+      ? `${text.slice(0, DELIVERABLE_CONTENT_MAX)}\n\n…[truncated — full findings on disk at ${filePath}]`
+      : text;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Render the sub-agent FINDINGS as an observed resource block (bounded to the most recent few), with
+ * each finding's MARKDOWN CONTENT inlined — not just metadata — so the brain can actually READ it. This
+ * is the input to the brain's job as the room's representative: it reads what its agents found and then
+ * decides, for the room, whether and how to communicate it (a visual it authors, a spoken line, both, or
+ * nothing). Findings are NEVER displayed raw — there is deliberately no "share this by id" path here.
+ */
+export function renderDeliverablesResource(
+  items: LogEntry<DeliverableRecord>[],
+  now: number = Date.now(),
+): string {
   const D = XML_TAGS.DELIVERABLES;
   const recent = items.slice(-MAX_DELIVERABLES_IN_CONTEXT);
   if (recent.length === 0) {
-    return `<${D} note="no sub-agent artifacts have been produced yet" />`;
+    return `<${D} note="no sub-agent findings yet" />`;
   }
   const lines = recent
     .map((e) => {
       const d = e.data;
       const path = d.filePath ? ` path="${xmlEscape(d.filePath)}"` : '';
       const desc = d.description ? ` description="${xmlEscape(d.description)}"` : '';
-      return `  <deliverable id="${xmlEscape(d.id)}" kind="${d.kind}" title="${xmlEscape(d.title)}"${path}${desc} />`;
+      /** How long ago it was produced — so a stale finding isn't surfaced as if it were fresh. */
+      const produced = ` produced="${ageOf(d.producedAt, now)}"`;
+      const attrs = `id="${xmlEscape(d.id)}" kind="${d.kind}" title="${xmlEscape(d.title)}"${path}${desc}${produced}`;
+      /** Inline the findings markdown (xml-escaped so it can't break the envelope) for the brain to READ. */
+      const content = readDeliverableContent(d.filePath);
+      if (!content) return `  <deliverable ${attrs} />`;
+      return `  <deliverable ${attrs}>\n${xmlEscape(content)}\n  </deliverable>`;
     })
     .join('\n');
   return (
-    `<${D} note="artifacts your sub-agents produced; to put one on the shared screen, call share_screen with its deliverableId">\n` +
+    `<${D} note="the findings your sub-agents produced — research written FOR YOU TO READ, not to display. You are the room's representative: read each, then decide whether and how to communicate it — a visual you AUTHOR, a spoken line, both, or nothing. NEVER put a finding on screen raw; re-express what matters in your own words/visuals">\n` +
     lines +
     `\n</${D}>`
   );
@@ -292,7 +404,10 @@ function truncate(s: string, max: number): string {
  * count is surfaced on the envelope so the model can see at a glance whether research is already in
  * flight — the signal that backs the hard re-fire rule ("never call_agent for a task already running").
  */
-export function renderSubAgentsResource(items: SubAgentTaskRecord[]): string {
+export function renderSubAgentsResource(
+  items: SubAgentTaskRecord[],
+  now: number = Date.now(),
+): string {
   const S = XML_TAGS.SUB_AGENTS;
   const latest = foldLatestById(items).slice(-MAX_SUB_AGENTS_IN_CONTEXT);
   const running = latest.filter((t) => t.status === 'running').length;
@@ -305,7 +420,9 @@ export function renderSubAgentsResource(items: SubAgentTaskRecord[]): string {
       const lastProgress = t.progress.at(-1) ?? '';
       const deliverable = t.deliverableId ? ` deliverable="${xmlEscape(t.deliverableId)}"` : '';
       const detail = t.status === 'error' && t.error ? truncate(t.error, SUB_AGENT_PROGRESS_MAX) : truncate(lastProgress, SUB_AGENT_PROGRESS_MAX);
-      return `  <task id="${xmlEscape(shortId)}" status="${t.status}" task="${xmlEscape(truncate(t.task, SUB_AGENT_TASK_MAX))}" last_progress="${xmlEscape(detail)}"${deliverable} />`;
+      /** For a live run, how long it's been going — so the brain can say "still digging, ~1 min in". */
+      const runningFor = t.status === 'running' ? ` running-for="${ageOf(t.startedAt, now)}"` : '';
+      return `  <task id="${xmlEscape(shortId)}" status="${t.status}" task="${xmlEscape(truncate(t.task, SUB_AGENT_TASK_MAX))}"${runningFor} last_progress="${xmlEscape(detail)}"${deliverable} />`;
     })
     .join('\n');
   return (
@@ -315,26 +432,32 @@ export function renderSubAgentsResource(items: SubAgentTaskRecord[]): string {
   );
 }
 
-/** The wall-clock for this beat — a live agent should know the time (mirrors Shipyard's <current-time/>). */
-function renderCurrentTime(): string {
-  return `<${XML_TAGS.CURRENT_TIME} iso="${new Date().toISOString()}" />`;
-}
-
 /**
- * The full set of observed resources for one beat. Injected into the SYSTEM channel (see
- * buildResourceMessages) so NOTHING the model reads as conversation is in-band.
+ * The full set of observed resources for one beat: the <meeting> envelope (conversation + screen) plus
+ * the agent's own workshop (<sub_agents>, <deliverables>). Injected into the SYSTEM channel (see
+ * buildResourceMessages) so NOTHING the model reads as conversation is in-band. One authoritative `now`
+ * (epoch ms) threads through so EVERY age in the beat is computed against the same instant.
  */
 export function renderResources(args: {
   transcript: LogEntry<TranscriptEntry>[];
   newSinceSeqNo: number;
   deliverables: LogEntry<DeliverableRecord>[];
   subAgents: LogEntry<SubAgentTaskRecord>[];
+  /** The current shared-screen state (what's shown + since when). Omitted ⇒ nothing on screen. */
+  screen?: ActiveShare | null;
+  /** This beat's authoritative clock (epoch ms). Defaults to now; injected for deterministic tests. */
+  now?: number;
 }): string {
+  const now = args.now ?? Date.now();
   return [
-    renderCurrentTime(),
-    renderTranscriptResource(args.transcript, args.newSinceSeqNo),
-    renderSubAgentsResource(args.subAgents.map((e) => e.data)),
-    renderDeliverablesResource(args.deliverables),
+    renderMeetingResource({
+      transcript: args.transcript,
+      newSinceSeqNo: args.newSinceSeqNo,
+      screen: args.screen ?? null,
+      now,
+    }),
+    renderSubAgentsResource(args.subAgents.map((e) => e.data), now),
+    renderDeliverablesResource(args.deliverables, now),
   ].join('\n');
 }
 
@@ -344,7 +467,7 @@ export function renderResources(args: {
  * concrete meaning of "Gemma has nothing in band" — the user turn is a content-free trigger to act.
  */
 const HEARTBEAT_PULSE =
-  '[heartbeat] You have just observed the live state resources in your context. Think briefly first: in one sentence, what (if anything) genuinely needs you right now? Then choose exactly one action for this beat — speak, share_screen, call_agent, or no_op. Default HARD to no_op: only act on a clear, specific opening where you add value the room does not already have. Do not call_agent for anything you can answer directly, anything trivial, or any task already shown as running in <sub_agents>.';
+  '[heartbeat] You have just observed the live state resources in your context. Think briefly first: in one sentence, what (if anything) genuinely needs you right now? Then choose exactly one action for this beat — speak, share_screen, call_agent, no_op, or sleep. Default HARD to no_op: only act on a clear, specific opening where you add value the room does not already have. Do not call_agent for anything you can answer directly, anything trivial, or any task already shown as running in <sub_agents>.';
 
 /**
  * Assemble the model input so observed state is NEVER in-band. Mirrors Shipyard's pattern (resources
@@ -362,12 +485,18 @@ export function buildResourceMessages(args: {
   deliverables: LogEntry<DeliverableRecord>[];
   /** Live sub-agent tasks (append-log; folded latest-per-id at render). */
   subAgents: LogEntry<SubAgentTaskRecord>[];
+  /** Current shared-screen state — the <screen> block inside <meeting>. Omitted ⇒ nothing shared. */
+  screen?: ActiveShare | null;
+  /** This beat's authoritative clock (epoch ms). Defaults to now; injected for deterministic tests. */
+  now?: number;
 }): ChatCompletionMessageParam[] {
   const resources = renderResources({
     transcript: args.transcript,
     newSinceSeqNo: args.newSinceSeqNo,
     deliverables: args.deliverables,
     subAgents: args.subAgents,
+    screen: args.screen ?? null,
+    now: args.now,
   });
   return [
     { role: 'system', content: args.system },
@@ -410,6 +539,12 @@ export interface DecideDeps {
    */
   transcript: AppendLog<TranscriptEntry>;
   /**
+   * The shared-screen state, read each beat (a getter so it always reflects the latest share) and
+   * injected as the <screen> block inside <meeting>. This is what lets the model reason about what's on
+   * screen and for how long ("keep the diagram up?"). Optional — when absent the screen renders empty.
+   */
+  screen?: () => ActiveShare | null;
+  /**
    * Optional sink for live inference stats. Called after each `cerebras.complete` with the
    * assembled result's usage + wall-clock tok/s, so the wiring can broadcast it to the web HUD
    * (the rate is otherwise computed in cerebras.ts and discarded). Errors here are not propagated.
@@ -430,10 +565,12 @@ export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry
      * orchestrator), fall back to one past the current head so nothing is marked new.
      */
     const newSinceSeqNo = delta[0]?.seqNo ?? deps.transcript.head() + 1;
+    /** One authoritative `now` for the whole beat, so every age is computed against the same instant. */
+    const now = Date.now();
     /**
      * Assemble the beat so nothing is in-band: identity+convention and the observed resource
      * envelopes go in the SYSTEM channel; the only user turn is a content-free heartbeat pulse. The
-     * transcript block is the FULL conversation snapshot with the new utterances marked.
+     * <meeting> block is the FULL conversation snapshot (new utterances marked) plus the current screen.
      */
     const messages = buildResourceMessages({
       system,
@@ -441,6 +578,8 @@ export function createDecide(deps: DecideDeps): (delta: LogEntry<TranscriptEntry
       newSinceSeqNo,
       deliverables: deps.deliverables.snapshot(),
       subAgents: deps.subAgents.snapshot(),
+      screen: deps.screen?.() ?? null,
+      now,
     });
     const result = await deps.cerebras.complete({
       messages,

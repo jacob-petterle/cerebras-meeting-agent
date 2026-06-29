@@ -80,12 +80,12 @@ export async function startMic(): Promise<void> {
 
   try {
     const ctx = new AudioContext();
-    // A fresh AudioContext can land in 'suspended' under the browser autoplay policy; resume it
-    // inside the mic-button gesture so the capture worklet's process() actually runs and PCM frames
-    // flow. This is the difference between "mic on, nothing streams" and a live pipeline (it didn't
-    // bite under a trusted automated click, but a real tab — backgrounded, refocused — can). No-op
-    // when already running.
-    if (ctx.state === 'suspended') await ctx.resume();
+    // A fresh AudioContext can land in 'suspended' under the browser autoplay policy. Kick off
+    // resume() but do NOT await it: in the chrome-less screenshare view we auto-start capture with no
+    // user gesture yet, and awaiting could stall the whole setup. The worklet is wired immediately;
+    // PCM flows the moment the context runs — either resume() succeeds, or the first user gesture
+    // does (see resumeMicContext). Under a real gesture (the debug mic button) it resumes at once.
+    if (ctx.state === 'suspended') void ctx.resume().catch(() => {});
     const source = ctx.createMediaStreamSource(stream);
     audioCtx = ctx;
     mediaStream = stream;
@@ -102,6 +102,15 @@ export async function startMic(): Promise<void> {
     sourceNode = null;
     throw err;
   }
+}
+
+/**
+ * Resume a suspended capture context. The autoplay policy can start the AudioContext suspended when
+ * the mic is auto-started without a user gesture (the chrome-less screenshare view); calling this on
+ * the first user interaction gets PCM flowing. No-op if the mic isn't started or is already running.
+ */
+export function resumeMicContext(): void {
+  if (audioCtx && audioCtx.state === 'suspended') void audioCtx.resume().catch(() => {});
 }
 
 export function stopMic(): void {

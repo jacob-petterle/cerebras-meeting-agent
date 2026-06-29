@@ -1,25 +1,30 @@
-import type { LogEntry, TranscriptEntry } from '@meeting-agent/protocol';
+import type { LogEntry, SubAgentTaskRecord, TranscriptEntry } from '@meeting-agent/protocol';
 import type { AppendLog } from './resources';
 import type { Decision } from './decide';
 
 /**
  * The heartbeat loop — the agent's clock.
  *
- * Injectable scheduler (never a real timer in tests). Each tick:
- *   1. read the delta `transcript.since(cursor)`; empty → return (no decide). Raw STT was appended to
- *      the transcript at capture time — there is NO corrector / second LLM pass anymore.
+ * Injectable scheduler (never a real timer in tests). The two load-bearing rules:
+ *
+ *   • EVERY tool is FIRE-AND-FORGET. No tool — TTS, a screen render, or a tens-of-minutes research
+ *     run — may block the heartbeat. The instant the brain picks a non-no_op action we advance the
+ *     cursor, release the busy lock, and dispatch the tool DETACHED; the heartbeat keeps ticking while
+ *     the tool works in the background. Holding the lock for a tool's whole run is exactly what froze
+ *     the brain. Re-deciding the same span is prevented by the IMMEDIATE cursor advance, not by holding
+ *     the lock.
+ *   • A turn ends ONLY on no_op. Acting earns another beat: after any non-no_op action we set
+ *     `pendingWake` so the next beat fires even with no new transcript — that's the "acknowledge → act →
+ *     follow up" / parallel-fan-out flow. The brain keeps getting beats until IT chooses no_op to yield
+ *     the floor. (A runaway guard caps consecutive actions with no human input, see MAX_TURN_ACTIONS.)
+ *
+ * Each tick:
+ *   1. read the delta `transcript.since(cursor)`. Empty AND no pending wake → return (no decide).
  *   2. claim the span: remember `claimedHead = delta.at(-1).seqNo` BEFORE deciding.
- *   3. decide on the delta. `no_op` → advance cursor to claimedHead, dispatch nothing.
- *   4. for a FAST action (speak/share_screen): dispatch DETACHED and hold the busy lock so the next
- *      tick can't fire a second action while this one is in-flight (the SEV-1 double-fire, guarded by
- *      a test). When it resolves, advance the cursor to claimedHead ONLY — content that arrived during
- *      the action stays unread and is reprocessed next tick.
- *   5. for `call_agent` (the SLOW research sub-agent, tens of seconds to minutes): FIRE-AND-FORGET.
- *      Dispatch detached, but advance the cursor AND release the busy lock IMMEDIATELY — do NOT hold
- *      the lock for the whole run. This is the non-blocking fix: the heartbeat keeps ticking while the
- *      sub-agent works, so the brain keeps observing/speaking and never freezes. Re-firing the SAME
- *      research is prevented NOT by the busy lock here but by the live <sub_agents> resource (the model
- *      sees status=running) plus a hard re-fire guard in the dispatch wrapper.
+ *   3. decide. `no_op` → advance cursor, end the turn, dispatch nothing.
+ *   4. any other tool → advance cursor + release lock + dispatch DETACHED + set `pendingWake` (continue
+ *      the turn). A finished/failed sub-agent later WAKES a fresh turn via the subAgents subscription,
+ *      so a background result (or a timeout) always gets a reaction instead of silence-until-next-speech.
  */
 
 /** The injectable clock. `every` registers a periodic callback and returns an unsubscribe. */
@@ -50,6 +55,14 @@ export interface OrchestratorDeps {
   decide: (delta: LogEntry<TranscriptEntry>[]) => Promise<Decision>;
   dispatch: (decision: Decision) => Promise<void>;
   scheduler: Scheduler;
+  /**
+   * The live sub-agent-task log. Optional (tests that drive tick() manually omit it). When present,
+   * the orchestrator subscribes to it and WAKES the brain when a research sub-agent reaches a terminal
+   * state (done/error) — events that never touch the transcript. Without this the brain would stay
+   * silent after a research finishes or TIMES OUT until the next person happens to speak. This is the
+   * non-transcript wake source that makes the agent respond to its own background work.
+   */
+  subAgents?: AppendLog<SubAgentTaskRecord>;
   /**
    * Observe EVERY decision the brain makes, including `no_op` (which dispatches nothing). UI-only —
    * the wiring broadcasts it to the console so a heartbeat that chose silence is still visible.
@@ -85,6 +98,19 @@ export interface Orchestrator {
 
 const HEARTBEAT_MS = 4000;
 
+/**
+ * Runaway guard. Acting continues the turn (only no_op ends it), and every tool is fire-and-forget,
+ * so a misbehaving model that keeps acting on empty context could spin the loop and spam speech / burn
+ * API tokens. We cap how many consecutive actions a turn may take WITHOUT new human input; past the cap
+ * we force a no_op to yield. Normal turns are 1–4 actions (acknowledge → research → share → yield), so
+ * this only ever trips on pathology. Reset to 0 whenever a human speaks (new turn) or the brain no_ops.
+ */
+const MAX_TURN_ACTIONS = 12;
+
+/** The `sleep` tool's stand-down window is clamped to this range (seconds) — long enough to matter, never indefinite. */
+const SLEEP_MIN_SECONDS = 2;
+const SLEEP_MAX_SECONDS = 120;
+
 export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   const { transcript, decide, dispatch, scheduler } = deps;
   const intervalMs = deps.intervalMs ?? HEARTBEAT_MS;
@@ -94,32 +120,73 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   let unsubscribe: (() => void) | null = null;
   /** Bumped by reset(); an in-flight tick captures it and only writes the cursor if it still matches. */
   let generation = 0;
+  /**
+   * Continue-the-turn signal. Set after any non-no_op action (and by the subAgents terminal wake), it
+   * lets a beat fire even with an empty transcript delta. Consumed (cleared) once per beat. This is the
+   * "a turn ends only on no_op" mechanism AND the "react to a finished/failed research" mechanism.
+   */
+  let pendingWake = false;
+  /** Consecutive non-no_op actions since the last human utterance / no_op — bounded by MAX_TURN_ACTIONS. */
+  let turnActions = 0;
+  /**
+   * Idle-heartbeat mute. The `sleep` tool sets this to `Date.now() + seconds*1000`; while now < mutedUntil
+   * the INTERVAL beat is suppressed — the agent deliberately stood down instead of being re-prompted every
+   * beat. It is cleared early when a person speaks (poke) or a research result settles (both zero it before
+   * waking), and on reset. This is the "yield WITH a duration" that sleep layers on top of no_op's single-beat yield.
+   */
+  let mutedUntil = 0;
+
+  /** Fire the next beat soon, off the current call stack. The busy lock + empty-delta gate make it safe. */
+  function scheduleBeat(): void {
+    queueMicrotask(() => {
+      void tick();
+    });
+  }
 
   async function tick(): Promise<void> {
-    /** Busy lock: an action is in-flight — do not start another tick. */
+    /** Busy lock: a decide() is in-flight — do not start a second (it would double-dispatch). */
     if (busy) return;
     busy = true;
 
     /**
-     * Snapshot the generation up front: a reset() during a later await must NOT let this tick write the
-     * cursor or decide on a wiped span.
+     * Sleeping: the `sleep` tool muted the idle clock — suppress this beat. Only the INTERVAL reaches here
+     * while muted; poke() and the sub-agent wake clear `mutedUntil` before waking, so a person speaking or
+     * a research result still gets through. The mute only stops the agent re-pinging ITSELF on the fallback clock.
+     */
+    if (Date.now() < mutedUntil) {
+      busy = false;
+      return;
+    }
+
+    /**
+     * Snapshot the generation up front: a reset() during the decide() await must NOT let this tick write
+     * the cursor or act on a wiped span.
      */
     const gen = generation;
 
     const delta = transcript.since(cursor);
-    if (delta.length === 0) {
+    /**
+     * Wake reasons: new transcript OR a pending continue/terminal-event wake. With neither there is
+     * nothing to decide — release and return (the brain stays silent; no wasted Gemma call). Consume
+     * the wake here so a signal that lands while we're busy isn't lost (it re-arms pendingWake).
+     */
+    const woken = pendingWake;
+    pendingWake = false;
+    if (delta.length === 0 && !woken) {
       busy = false;
       return;
     }
+
+    /** A human speaking starts a fresh turn — reset the runaway counter. */
+    if (delta.some((e) => e.data.senderKind === 'human')) turnActions = 0;
 
     /** Claim the span now, before deciding, so we only ever advance past what we considered. */
     const claimedHead = delta[delta.length - 1]?.seqNo ?? cursor;
 
     /**
-     * `decide` runs the brain (network). If it throws, the busy lock MUST still release and the
-     * cursor MUST advance past the claimed span — otherwise the heartbeat wedges forever (no
-     * tick ever clears `busy`) and the same delta is re-decided on a loop. On a decide error we
-     * fall through to the no-op path: advance, release, return.
+     * `decide` runs the brain (network). If it throws, the busy lock MUST still release and the cursor
+     * MUST advance past the claimed span — otherwise the heartbeat wedges forever and the same delta is
+     * re-decided on a loop. On a decide error we fall through to the no-op path: advance, release, return.
      */
     let decision: Decision;
     deps.onThinkingChange?.(true);
@@ -134,59 +201,87 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     }
     deps.onThinkingChange?.(false);
 
+    /** Runaway guard: too many back-to-back actions with no human input → force a yield this beat. */
+    if (decision.name !== 'no_op' && turnActions >= MAX_TURN_ACTIONS) {
+      console.warn(`[orchestrator] turn action cap (${MAX_TURN_ACTIONS}) reached — forcing no_op to yield`);
+      decision = { name: 'no_op', args: { reason: 'turn action cap reached' } };
+    }
+
     /** Report EVERY decision (incl. no_op) for the console. UI-only — never written to the transcript. */
     deps.onDecision?.(decision);
 
-    if (decision.name === 'no_op') {
-      if (gen === generation) cursor = claimedHead;
-      busy = false;
-      return;
-    }
-
-    if (decision.name === 'call_agent') {
+    if (decision.name === 'no_op' || decision.name === 'sleep') {
       /**
-       * FIRE-AND-FORGET — the non-blocking fix. The research sub-agent runs for tens of seconds to
-       * minutes; holding the busy lock for its whole run is exactly what froze the brain. Instead we
-       * advance the cursor past the claimed span and RELEASE the lock NOW, so the very next tick keeps
-       * the heartbeat alive while the sub-agent works in the background. The dispatch is detached and
-       * owns its own errors (it appends running→done/error status to the <sub_agents> resource); we
-       * only log if it rejects. Re-firing the same task is prevented by that resource + the re-fire
-       * guard in the dispatch wrapper, NOT by this lock. A reset() that lands before this line bumps
-       * `generation`, so the cursor write is skipped (the span it pointed at was wiped).
+       * Both END the turn (advance the cursor, reset the counter, do NOT continue). `sleep` additionally
+       * mutes the idle heartbeat for a clamped window, so the agent isn't re-prompted while it has
+       * deliberately stood down — a person speaking or a research result wakes it early (see poke/subscribe).
        */
+      if (decision.name === 'sleep') {
+        const requested = Number((decision.args as { seconds?: unknown }).seconds);
+        const seconds = Number.isFinite(requested)
+          ? Math.min(SLEEP_MAX_SECONDS, Math.max(SLEEP_MIN_SECONDS, requested))
+          : SLEEP_MIN_SECONDS;
+        mutedUntil = Date.now() + seconds * 1000;
+        console.log(`[orchestrator] sleep ${seconds}s — idle heartbeat muted until a person speaks or research lands`);
+      }
+      turnActions = 0;
       if (gen === generation) cursor = claimedHead;
       busy = false;
-      void dispatch(decision).catch((err: unknown) => {
-        console.error('[orchestrator] call_agent dispatch failed (detached):', err);
-      });
       return;
     }
 
     /**
-     * Detach the dispatch: a FAST action (speak/share_screen) is quick, but the busy lock stays held
-     * until it resolves so no second action fires on the claimed span (the SEV-1 double-fire). The
-     * cursor advances to claimedHead only — not to the current head — so anything that arrived
-     * mid-action is reprocessed next tick. A reset() during the action bumps `generation`, so the
-     * cursor write below is skipped (the span it pointed at was wiped).
+     * Any non-no_op action — speak, share_screen, call_agent — is FIRE-AND-FORGET: advance the cursor +
+     * release the lock NOW, then dispatch DETACHED so the heartbeat never blocks on the tool. A reset()
+     * during decide() bumps `generation`, so the cursor write is skipped (the span it pointed at was wiped).
+     *
+     * The turn continues until no_op, but HOW the next beat is armed differs by tool:
+     *   • call_agent has no transcript write-back until its (long) run finishes, so we eagerly arm the
+     *     next beat here — that's what lets the brain immediately fan out more parallel research or speak
+     *     a follow-up WHILE the run works in the background.
+     *   • speak / share_screen continue via their transcript write-back instead: the agent's own line
+     *     echoes back next beat as kind="agent" (memory), so it can "acknowledge → THEN act" exactly as
+     *     the identity prompt describes. main.ts pokes us the moment that write-back lands, so it stays
+     *     snappy without an eager, memory-less beat that could make the brain repeat itself.
      */
-    void dispatch(decision)
-      .then(() => {
-        if (gen === generation) cursor = claimedHead;
-      })
-      .catch((err: unknown) => {
-        /** Action failed: still advance past the claimed span so we don't re-fire it forever. */
-        console.error('[orchestrator] dispatch failed:', err);
-        if (gen === generation) cursor = claimedHead;
-      })
-      .finally(() => {
-        busy = false;
-      });
+    turnActions += 1;
+    if (gen === generation) cursor = claimedHead;
+    busy = false;
+    void dispatch(decision).catch((err: unknown) => {
+      console.error('[orchestrator] dispatch failed (detached):', err);
+    });
+    if (decision.name === 'call_agent') {
+      pendingWake = true;
+      scheduleBeat();
+    }
   }
 
   return {
     start() {
       unsubscribe?.();
-      unsubscribe = scheduler.every(intervalMs, tick);
+      const stops: Array<() => void> = [scheduler.every(intervalMs, tick)];
+      /**
+       * Wake the brain when a research sub-agent SETTLES (done/error) — events the transcript never
+       * carries. `done` also surfaces a deliverable to share; `error` (incl. a timeout) is otherwise
+       * invisible, so without this wake the agent would never acknowledge a research that failed. We
+       * ignore `running`/progress appends (too chatty); the brain reads those ambiently when it next
+       * decides for another reason.
+       */
+      if (deps.subAgents) {
+        stops.push(
+          deps.subAgents.subscribe((entry) => {
+            if (entry.data.status === 'done' || entry.data.status === 'error') {
+              /** A research result landing wakes the brain even if it was sleeping. */
+              mutedUntil = 0;
+              pendingWake = true;
+              scheduleBeat();
+            }
+          }),
+        );
+      }
+      unsubscribe = () => {
+        for (const stop of stops) stop();
+      };
       return () => {
         unsubscribe?.();
         unsubscribe = null;
@@ -201,16 +296,24 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     },
     reset() {
       /**
-       * Invalidate any in-flight tick (so its deferred cursor write is dropped) and rewind to the
-       * start. We deliberately do NOT clear `busy`: a dispatch may still be running, and clearing it
-       * would let the next tick start a second action concurrently (the SEV-1 double-fire). The
-       * in-flight action's `.finally` releases `busy` normally; its cursor write is skipped by `gen`.
+       * Invalidate any in-flight tick (so a cursor write from a decide() that's still awaiting is
+       * dropped) and rewind to the start. A queued continue/terminal wake for the wiped session is
+       * meaningless, so clear it and end any turn in progress. We deliberately do NOT clear `busy`: a
+       * decide() may still be awaiting, and clearing it would let the next tick run concurrently; its
+       * own release path clears `busy` normally, and its cursor write is skipped by the `gen` guard.
        */
       generation += 1;
       cursor = -1;
+      pendingWake = false;
+      turnActions = 0;
+      mutedUntil = 0;
     },
     poke() {
-      /** tick() already guards on the busy lock + empty delta, so an extra call is always safe. */
+      /**
+       * A person speaking ends any sleep — clear the mute so this beat actually runs. tick() already
+       * guards on the busy lock + empty delta, so an extra call is always safe.
+       */
+      mutedUntil = 0;
       void tick();
     },
   };

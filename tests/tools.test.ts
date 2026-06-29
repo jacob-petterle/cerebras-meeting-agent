@@ -175,7 +175,7 @@ describe('tool registry routing (decide → act)', () => {
       const outcome = await reg.dispatch({ name: 'call_agent', args: { task: 'research the thing' } });
 
       expect(deliverables.snapshot()).toHaveLength(1);
-      expect(deliverables.snapshot()[0]!.data.kind).toBe('html');
+      expect(deliverables.snapshot()[0]!.data.kind).toBe('markdown');
       // call_agent → a `tool` turn naming the task + the deliverable id it produced.
       const deliverableId = deliverables.snapshot()[0]!.data.id;
       expect(outcome).toEqual({
@@ -233,7 +233,7 @@ describe('call_agent mock', () => {
       expect(rec).not.toBeNull();
       // matches the shared schema
       expect(() => DeliverableRecord.parse(rec)).not.toThrow();
-      expect(rec!.kind).toBe('html');
+      expect(rec!.kind).toBe('markdown');
 
       // filePath is real and on disk
       expect(rec!.filePath).toBeTruthy();

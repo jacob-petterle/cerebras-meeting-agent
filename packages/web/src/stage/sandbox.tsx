@@ -57,13 +57,62 @@ const BRIDGE_SCRIPT = `<script>
 })();
 </script>`;
 
+/**
+ * Fit-to-viewport scale factor for content of size (contentW x contentH) inside a viewport
+ * (viewW x viewH). Returns a value in (0, 1]: 1 when the content already fits (we never ENLARGE —
+ * blowing up a tiny stub looks worse than leaving it), otherwise the largest uniform scale that fits
+ * BOTH dimensions, with a small safety margin so nothing is flush against the edge (which would leave
+ * a scrollbar). Taking the min of both ratios guarantees the scaled content satisfies both bounds.
+ *
+ * Exported (and pure) so it is unit-testable AND so it is the single source of truth: FIT_SCRIPT
+ * serialises this exact function into the sandbox via `.toString()`, rather than re-deriving the math.
+ */
+export function computeFitScale(
+  contentW: number,
+  contentH: number,
+  viewW: number,
+  viewH: number,
+): number {
+  if (contentW <= 0 || contentH <= 0 || viewW <= 0 || viewH <= 0) return 1;
+  const scale = Math.min(1, viewW / contentW, viewH / contentH);
+  return scale < 1 ? scale * 0.98 : 1;
+}
+
+/**
+ * The screenshare backstop. Agent-authored HTML is shown as a single, non-scrollable slide (the Zoom
+ * bot captures a static 1280x720 frame — nobody can scroll), so content taller/wider than the stage
+ * would otherwise be clipped below the fold. This measures the content at its natural size and applies
+ * CSS `zoom` (which reflows, unlike `transform: scale`) so it shrinks to fit instead of clipping.
+ *
+ * We re-measure at zoom='' (natural) every pass so the computation is stable, and re-fit on load,
+ * resize, font readiness, and a few timed retries to catch late reflow (images/fonts/async content).
+ * The PROMPT (callAgent/cursor.ts) is the real fix — authoring to fit beats shrinking to fit — this
+ * just guarantees nothing is ever silently cut off.
+ */
+const FIT_SCRIPT = `<script>
+(function(){
+  var computeFitScale = ${computeFitScale.toString()};
+  function fit(){
+    var root = document.documentElement;
+    if(!root) return;
+    root.style.zoom = '';
+    var scale = computeFitScale(root.scrollWidth, root.scrollHeight, window.innerWidth, window.innerHeight);
+    root.style.zoom = scale === 1 ? '' : String(scale);
+  }
+  window.addEventListener('load', fit);
+  window.addEventListener('resize', fit);
+  if (document.fonts && document.fonts.ready) { document.fonts.ready.then(fit); }
+  [0, 150, 500, 1200].forEach(function(d){ setTimeout(fit, d); });
+})();
+</script>`;
+
 function hasHtmlStructure(content: string): boolean {
   const lead = content.trimStart().slice(0, 20).toLowerCase();
   return lead.startsWith('<!doctype') || lead.startsWith('<html');
 }
 
-function buildSrcDoc(content: string): string {
-  const head = `<meta charset="utf-8">${CSP_META}<style>${THEME_CSS}</style>${BRIDGE_SCRIPT}`;
+function buildSrcDoc(content: string, fit: boolean): string {
+  const head = `<meta charset="utf-8">${CSP_META}<style>${THEME_CSS}</style>${BRIDGE_SCRIPT}${fit ? FIT_SCRIPT : ''}`;
   if (hasHtmlStructure(content)) {
     const lower = content.toLowerCase();
     const headClose = lower.indexOf('</head>');
@@ -88,11 +137,17 @@ interface SandboxProps {
   pluginData?: Record<string, unknown>;
   /** Fires when the frame calls `shipyardPush()` (Option B). */
   onPluginPush?: (payload: unknown) => void;
+  /**
+   * Shrink overflowing content to fit the stage (the screenshare backstop). Defaults to true — every
+   * stage render is a non-scrollable slide. Pass false only for a surface that should keep its own
+   * native scroll.
+   */
+  fit?: boolean;
 }
 
-export function Sandbox({ content, pluginData, onPluginPush }: SandboxProps) {
+export function Sandbox({ content, pluginData, onPluginPush, fit = true }: SandboxProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  const srcDoc = useMemo(() => buildSrcDoc(content), [content]);
+  const srcDoc = useMemo(() => buildSrcDoc(content, fit), [content, fit]);
 
   useEffect(() => {
     const frame = frameRef.current;

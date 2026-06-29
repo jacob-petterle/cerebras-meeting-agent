@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * The 4 tools Gemma can call. Zod schemas double as the source for the
+ * The 5 tools Gemma can call. Zod schemas double as the source for the
  * OpenAI tool JSON-schema (decide.ts converts them) and for runtime arg validation
  * in the tool registry.
  */
@@ -23,7 +23,17 @@ export type CallAgentArgs = z.infer<typeof CallAgentArgs>;
 export const NoOpArgs = z.object({ reason: z.string().optional() });
 export type NoOpArgs = z.infer<typeof NoOpArgs>;
 
-export type ToolName = 'speak' | 'share_screen' | 'call_agent' | 'no_op';
+/**
+ * sleep: a yield WITH a duration. Like no_op it ends the turn, but it also tells the heartbeat to stop
+ * self-pinging on the idle clock for `seconds` — the agent deliberately steps back instead of being
+ * re-prompted every beat (e.g. "I just put a diagram up, sit with it before reconsidering", or "the room
+ * is quiet, I'll stop checking for a bit"). A new human utterance — or a research result landing — wakes
+ * it early; the orchestrator clamps `seconds` to a sane window. `reason` is for the console only.
+ */
+export const SleepArgs = z.object({ seconds: z.number(), reason: z.string().optional() });
+export type SleepArgs = z.infer<typeof SleepArgs>;
+
+export type ToolName = 'speak' | 'share_screen' | 'call_agent' | 'no_op' | 'sleep';
 
 export interface ToolCall {
   name: ToolName;
@@ -37,4 +47,5 @@ export const TOOL_ARGS = {
   share_screen: ShareScreenArgs,
   call_agent: CallAgentArgs,
   no_op: NoOpArgs,
+  sleep: SleepArgs,
 } as const;

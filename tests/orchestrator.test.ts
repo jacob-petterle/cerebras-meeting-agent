@@ -100,9 +100,12 @@ describe('orchestrator heartbeat', () => {
     expect(decide).toHaveBeenCalledTimes(1);
   });
 
-  it('holds a busy lock: a slow FAST action in-flight blocks the next tick from firing a second action', async () => {
-    // The busy-lock double-fire guard applies to FAST actions (speak/share_screen). call_agent is now
-    // fire-and-forget (a separate test below), so this uses `speak` to keep the original intent intact.
+  it('every tool is fire-and-forget: a slow speak does NOT block the heartbeat (cursor advances immediately)', async () => {
+    // The non-blocking rule applies to ALL tools, not just call_agent. A FAST action (speak) that stays
+    // in-flight must NOT hold the heartbeat: the cursor advances + the lock releases the instant the tool
+    // is dispatched, so the brain can keep deciding while the slow tool runs in the background. (speak does
+    // NOT get an eager continue-beat — it continues via its transcript write-back, exercised elsewhere —
+    // so a memory-less empty-delta beat can't make it echo itself.)
     const transcript = createAppendLog<TranscriptEntry>();
     transcript.append(entry('say something')); // seqNo 0
 
@@ -111,7 +114,7 @@ describe('orchestrator heartbeat', () => {
       args: { text: 'on it' },
     }));
 
-    // A slow dispatch we control: the speak action stays in-flight until released.
+    // A slow dispatch we control: the speak tool stays in-flight until released — it must not block anything.
     let release!: () => void;
     const gate = new Promise<void>((res) => {
       release = res;
@@ -124,41 +127,38 @@ describe('orchestrator heartbeat', () => {
     const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
     orch.start();
 
-    // Tick 1: starts speak; dispatch is pending on the gate.
+    // Tick 1: speak dispatched and STILL in-flight (parked on the gate). The heartbeat did not wait — the
+    // cursor already advanced past the claimed span. No eager continue-beat fires for speak.
     await tick();
-    expect(decide).toHaveBeenCalledTimes(1);
+    await flush();
     expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(orch.getCursor().transcript).toBe(0);
+    expect(decide).toHaveBeenCalledTimes(1);
 
-    // More transcript arrives while the action is in-flight.
+    // New transcript arrives WHILE the first speak is still in-flight.
     transcript.append(entry('and also Y')); // seqNo 1
 
-    // Tick 2: busy lock holds — no second decide, no second dispatch.
+    // Tick 2: the brain decides AGAIN despite the in-flight speak — proof a slow tool never blocked it.
     await tick();
-    expect(decide).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledTimes(1);
-
-    // Release the in-flight action: lock frees and the cursor advances ONLY past the claimed span.
-    release();
     await flush();
-    expect(orch.getCursor().transcript).toBe(0);
-
-    // Tick 3: the content that arrived during the action is now processed fresh.
-    await tick();
     expect(decide).toHaveBeenCalledTimes(2);
     expect(decide.mock.calls[1]![0].map((e) => e.data.text)).toEqual(['and also Y']);
+    expect(dispatch).toHaveBeenCalledTimes(2);
+
+    release();
+    await flush();
   });
 
-  it('a call_agent decision is FIRE-AND-FORGET: it does NOT block the next tick (the brain keeps ticking)', async () => {
-    // The non-blocking fix (#16). A slow research sub-agent must not hold the busy lock for its whole
-    // run. The orchestrator advances the cursor + releases busy the instant it dispatches call_agent,
-    // so the very next tick decides again WHILE the sub-agent is still "in flight".
+  it('call_agent is fire-and-forget AND continues the turn until no_op', async () => {
+    // A slow research sub-agent must not hold the lock for its whole run; the orchestrator advances the
+    // cursor + releases busy the instant it dispatches call_agent. Acting also CONTINUES the turn, so a
+    // continue-beat fires while the sub-agent is still in flight — and the brain no_ops to yield the floor.
     const transcript = createAppendLog<TranscriptEntry>();
     transcript.append(entry('please research X')); // seqNo 0
 
     let calls = 0;
     const decide = vi.fn(async (_delta: LogEntry<TranscriptEntry>[]): Promise<Decision> => {
       calls += 1;
-      // First beat dispatches research; afterwards the brain stays silent.
       return calls === 1
         ? { name: 'call_agent', args: { task: 'research X' } }
         : { name: 'no_op', args: {} };
@@ -171,21 +171,66 @@ describe('orchestrator heartbeat', () => {
     const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
     orch.start();
 
-    // Tick 1: dispatches call_agent (detached, never resolves). Cursor advances + busy released NOW.
+    // Tick 1: dispatches call_agent (detached, never resolves). Cursor advances + busy released NOW, and
+    // the turn continues → an auto-beat decides AGAIN while the run is still in flight, then no_ops.
     await tick();
     await flush();
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(orch.getCursor().transcript).toBe(0);
+    expect(decide).toHaveBeenCalledTimes(2); // call_agent beat + the continue-beat (proof it never blocked)
 
-    // New content arrives while the sub-agent is still running.
+    // New human input later starts a fresh turn and decides on the new line.
     transcript.append(entry('meanwhile, another point')); // seqNo 1
-
-    // Tick 2: the brain DECIDES AGAIN even though the sub-agent run is still in flight — not blocked.
     await tick();
     await flush();
-    expect(decide).toHaveBeenCalledTimes(2);
-    expect(decide.mock.calls[1]![0].map((e) => e.data.text)).toEqual(['meanwhile, another point']);
+    expect(decide).toHaveBeenCalledTimes(3);
+    expect(decide.mock.calls[2]![0].map((e) => e.data.text)).toEqual(['meanwhile, another point']);
     expect(orch.getCursor().transcript).toBe(1);
+  });
+
+  it('wakes the brain when a sub-agent settles (done/error) even with NO new transcript', async () => {
+    // The core fix: a research sub-agent reaching a terminal state never touches the transcript, so a
+    // purely transcript-driven heartbeat would stay silent after a research finishes — or TIMES OUT —
+    // until the next person speaks. Subscribing to the subAgents log wakes a fresh beat on done/error.
+    const transcript = createAppendLog<TranscriptEntry>();
+    const subAgents = createAppendLog<SubAgentTaskRecordT>();
+    const decide = vi.fn(async (_delta: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
+      name: 'no_op',
+      args: {},
+    }));
+    const dispatch = vi.fn(async (_d: Decision) => {});
+    const { scheduler, tick } = fakeScheduler();
+    const orch = createOrchestrator({ transcript, decide, dispatch, scheduler, subAgents });
+    orch.start();
+
+    // No transcript → a plain tick decides nothing (the brain stays silent).
+    await tick();
+    expect(decide).not.toHaveBeenCalled();
+
+    // A `running` / progress append must NOT wake the brain (too chatty) — only terminal states do.
+    subAgents.append(
+      SubAgentTaskRecord.parse({ id: 'a1', status: 'running', task: 'research X', startedAt: 1 }),
+    );
+    await flush();
+    expect(decide).not.toHaveBeenCalled();
+
+    // The research then FAILS (e.g. a timeout) — appended to the subAgents log, not the transcript.
+    subAgents.append(
+      SubAgentTaskRecord.parse({
+        id: 'a1',
+        status: 'error',
+        task: 'research X',
+        startedAt: 1,
+        error: 'Timed out',
+        endedAt: 9,
+      }),
+    );
+    await flush();
+
+    // The terminal event WOKE the brain: it decided despite an empty transcript delta, so it can react
+    // (acknowledge the failure / share a result) instead of going silent until someone next speaks.
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect(decide.mock.calls[0]![0]).toEqual([]); // empty transcript delta — woken purely by the resource
   });
 
   it('a decide() that rejects releases the busy lock and the next tick runs again (no wedge)', async () => {
@@ -228,16 +273,18 @@ describe('orchestrator heartbeat', () => {
     }
   });
 
-  it('a dispatch that rejects logs + advances the cursor + releases busy (no re-fire loop)', async () => {
+  it('a detached dispatch that rejects logs (no wedge, no crash) and the cursor still advanced', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const transcript = createAppendLog<TranscriptEntry>();
       transcript.append(entry('do the thing')); // seqNo 0
 
-      const decide = vi.fn(async (_delta: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
-        name: 'speak',
-        args: { text: 'on it' },
-      }));
+      let calls = 0;
+      const decide = vi.fn(async (_delta: LogEntry<TranscriptEntry>[]): Promise<Decision> => {
+        calls += 1;
+        // Speak once, then yield — otherwise the turn would self-chain until the runaway cap.
+        return calls === 1 ? { name: 'speak', args: { text: 'on it' } } : { name: 'no_op', args: {} };
+      });
       let dispatches = 0;
       const dispatch = vi.fn(async (_d: Decision) => {
         dispatches += 1;
@@ -251,15 +298,15 @@ describe('orchestrator heartbeat', () => {
       await tick();
       await flush();
 
-      // Logged with the exact prefix the QA spec requires.
-      expect(errSpy).toHaveBeenCalledWith('[orchestrator] dispatch failed:', expect.any(Error));
-      // Cursor advanced past the claimed span so we don't re-fire forever, and busy is released.
+      // The DETACHED dispatch rejected; the orchestrator logs it and stays alive (no wedge, no crash).
+      expect(errSpy).toHaveBeenCalledWith('[orchestrator] dispatch failed (detached):', expect.any(Error));
+      // Cursor advanced past the claimed span immediately (fire-and-forget), and only one dispatch fired.
       expect(orch.getCursor().transcript).toBe(0);
       expect(dispatches).toBe(1);
 
-      // No new content → next tick must not re-dispatch the same (already-claimed) span.
+      // No new content → the continue-beat already yielded; a further tick does not re-dispatch.
       await tick();
-      expect(decide).toHaveBeenCalledTimes(1);
+      await flush();
       expect(dispatches).toBe(1);
     } finally {
       errSpy.mockRestore();
@@ -333,25 +380,26 @@ describe('orchestrator + transcript write-back (the main.ts dispatch wrapper)', 
     const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
     orch.start();
 
-    // Tick 1: speak → TTS played → the agent's line is appended to the transcript.
+    // Tick 1: speak → TTS played → the agent's line is appended to the transcript (by the detached
+    // dispatch). Drive a few beats so the continue-beat + the write-back beat both settle.
     await tick();
     await flush();
-    expect(played).toHaveLength(1);
-    const afterSpeak = transcript.snapshot();
-    expect(afterSpeak).toHaveLength(2);
-    expect(afterSpeak[1]!.data).toMatchObject({
-      participantId: 'agent',
-      senderKind: 'agent',
-      text: 'four',
-    });
+    await tick();
+    await flush();
+    await tick();
+    await flush();
 
-    // Tick 2: the model now sees its OWN prior turn in the delta and no_ops — the loop self-terminates.
-    await tick();
-    await flush();
-    expect(decide).toHaveBeenCalledTimes(2);
-    // The second decide saw exactly the agent's self-authored line (memory of its prior turn).
-    expect(decide.mock.calls[1]![0].map((e) => e.data.text)).toEqual(['four']);
-    // No further append (no_op writes nothing back) → no runaway growth.
+    // Spoke exactly once; the agent's line was written back exactly once.
+    expect(played).toHaveLength(1);
+    const snap = transcript.snapshot();
+    expect(snap).toHaveLength(2);
+    expect(snap[1]!.data).toMatchObject({ participantId: 'agent', senderKind: 'agent', text: 'four' });
+
+    // The model saw its OWN prior turn (memory) on some beat — then no_op'd. The loop self-terminates:
+    // no second speak, no runaway transcript growth, and the cursor settles past the agent's own line.
+    const sawOwnLine = decide.mock.calls.some((c) => c[0].map((e) => e.data.text).join(',') === 'four');
+    expect(sawOwnLine).toBe(true);
+    expect(orch.getCursor().transcript).toBe(1);
     expect(transcript.snapshot()).toHaveLength(2);
   });
 });
@@ -387,10 +435,10 @@ describe('orchestrator: decision feed + reset', () => {
     expect(seen).toEqual([{ name: 'no_op', args: {} }]); // …but is still reported to the feed.
   });
 
-  it('reset() rewinds the cursor to -1 and a guarded in-flight dispatch cannot clobber it', async () => {
-    // Uses a FAST action (speak) parked on a gate: the cursor only advances when the dispatch resolves,
-    // so the reset's generation-guard has a window to invalidate the deferred cursor write. (call_agent
-    // is fire-and-forget and advances the cursor synchronously, so it can't exercise this race.)
+  it('reset() during an in-flight decide() invalidates that beat\'s cursor write (generation guard)', async () => {
+    // Every tool is now fire-and-forget (cursor advances synchronously after decide), so the race the
+    // generation guard protects is a reset() landing DURING the decide() await. We park the brain
+    // mid-decide, reset, then resolve — the post-decide cursor write must be skipped.
     const transcript = createAppendLog<TranscriptEntry>();
     transcript.append(entry('say X')); // seqNo 0 → claimedHead 0
 
@@ -398,29 +446,29 @@ describe('orchestrator: decision feed + reset', () => {
     const gate = new Promise<void>((res) => {
       release = res;
     });
-    const decide = vi.fn(async (_d: LogEntry<TranscriptEntry>[]): Promise<Decision> => ({
-      name: 'speak',
-      args: { text: 'X' },
-    }));
-    const dispatch = vi.fn(async (d: Decision) => {
-      if (d.name === 'speak') await gate;
+    const decide = vi.fn(async (_d: LogEntry<TranscriptEntry>[]): Promise<Decision> => {
+      await gate; // park the brain mid-decide
+      return { name: 'no_op', args: {} };
     });
+    const dispatch = vi.fn(async (_d: Decision) => {});
     const { scheduler, tick } = fakeScheduler();
     const orch = createOrchestrator({ transcript, decide, dispatch, scheduler });
     orch.start();
 
-    // Tick 1: starts speak; it parks on the gate, so the cursor has NOT advanced yet.
-    await tick();
-    expect(dispatch).toHaveBeenCalledTimes(1);
+    // Tick 1: enters decide() and parks on the gate. The cursor has NOT been written yet.
+    const inflight = tick();
+    await flush();
+    expect(decide).toHaveBeenCalledTimes(1);
     expect(orch.getCursor().transcript).toBe(-1);
 
-    // Reset while the action is in-flight: cursor → -1 and the generation is bumped.
+    // Reset while decide() is in-flight: cursor → -1 and the generation is bumped.
     orch.reset();
     expect(orch.getCursor().transcript).toBe(-1);
 
-    // The in-flight dispatch resolves. WITHOUT the guard it would advance the cursor to claimedHead
-    // (0); the reset's generation bump must make that deferred write a no-op, leaving the cursor at -1.
+    // decide() resolves. WITHOUT the guard it would advance the cursor to claimedHead (0); the reset's
+    // generation bump must make that write a no-op, leaving the cursor at -1.
     release();
+    await inflight;
     await flush();
     expect(orch.getCursor().transcript).toBe(-1);
   });

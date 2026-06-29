@@ -133,6 +133,14 @@ export function createRegistry(deps: RegistryDeps): ToolRegistry {
           await runNoOp(args);
           return null;
         }
+        case 'sleep': {
+          /**
+           * `sleep` is handled entirely by the orchestrator — it mutes the idle heartbeat and ends the
+           * turn, exactly like no_op — and is never dispatched here. It IS a ToolName, so the exhaustive
+           * switch must account for it; if one ever reaches the registry it's simply a no-op.
+           */
+          return null;
+        }
         default:
           return assertNever(call.name);
       }

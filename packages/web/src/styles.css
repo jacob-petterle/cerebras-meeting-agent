@@ -735,8 +735,8 @@ h3 {
 }
 .agent-orb .aura-box {
   aspect-ratio: 1 / 1;
-  height: clamp(160px, 36vmin, 340px);
-  max-width: 84%;
+  height: clamp(190px, 50vmin, 430px);
+  max-width: 86%;
 }
 .agent-orb .agent-orb-label {
   position: absolute;

@@ -68,7 +68,7 @@ function nonWritingFactory(run: CursorRun, spies: { closed: () => void; prompt: 
 
 /**
  * A factory whose `send` WRITES the findings file the prompt names (the success path). The prompt
- * carries the absolute FINDINGS-*.html path; we extract the basename and write into `dir` (which is
+ * carries the absolute FINDINGS-*.md path; we extract the basename and write into `dir` (which is
  * the resolved outDir), exactly where cursor.ts will read it back.
  */
 function writingFactory(
@@ -79,8 +79,8 @@ function writingFactory(
   const agent: CursorAgent = {
     send: async (prompt: string) => {
       spies.prompt(prompt);
-      const match = prompt.match(/FINDINGS-[0-9a-f-]+\.html/);
-      if (match) writeFileSync(join(dir, match[0]), '<h1>Agent-written findings</h1>', 'utf-8');
+      const match = prompt.match(/FINDINGS-[0-9a-f-]+\.md/);
+      if (match) writeFileSync(join(dir, match[0]), '# Agent-written findings', 'utf-8');
       return run;
     },
     close: () => spies.closed(),
@@ -129,7 +129,7 @@ describe('call_agent (real Cursor SDK, injected fake agent)', () => {
       // The deliverable points at the AGENT-WRITTEN file (real findings).
       expect(rec).not.toBeNull();
       expect(() => DeliverableRecord.parse(rec)).not.toThrow();
-      expect(rec!.kind).toBe('html');
+      expect(rec!.kind).toBe('markdown');
       expect(rec!.filePath).toBeTruthy();
       expect(readFileSync(rec!.filePath ?? '', 'utf-8')).toContain('Agent-written findings');
       // Description derives from the run summary.
@@ -342,7 +342,7 @@ describe('call_agent sub-agent status emission (running → done / error)', () =
 
       const rec = await callAgent({ task: 'no status please' });
       expect(rec).not.toBeNull();
-      expect(rec!.kind).toBe('html');
+      expect(rec!.kind).toBe('markdown');
       expect(deliverables.snapshot()).toHaveLength(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });

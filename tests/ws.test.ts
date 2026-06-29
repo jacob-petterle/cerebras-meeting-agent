@@ -109,6 +109,51 @@ describe('ws resource protocol', () => {
     }
   });
 
+  it('play goes to ONE sink (latest client), but render broadcasts to all; sink promotes on disconnect', async () => {
+    // Regression for the double-audio bug: when two clients are connected (a second tab, the console
+    // next to the stage, a Shipyard webview beside a browser), TTS `play` must reach exactly ONE of
+    // them or the utterance plays twice, slightly offset. render/transcript still go to everyone.
+    const resources = createResources();
+    const handle = createWsServer({ resources, port: 0 });
+    const port = await handle.whenReady;
+
+    const a = new WebSocket(`ws://127.0.0.1:${port}`);
+    await once(a, 'open');
+    const b = new WebSocket(`ws://127.0.0.1:${port}`); // connects last → becomes the audio sink
+    await once(b, 'open');
+    const fa = frameQueue(a);
+    const fb = frameQueue(b);
+
+    try {
+      // play then render. Only the sink (b) gets play; both get render. Ordering on b: play, then render.
+      handle.broadcastPlay(Int16Array.from([5, 5]), 24000);
+      handle.broadcastRender({ kind: 'html', payload: '<b>x</b>' });
+
+      const bFirst = await fb.next();
+      expect(bFirst.type).toBe('play');
+      const bSecond = await fb.next();
+      expect(bSecond.type).toBe('render');
+
+      // a skipped the play entirely — its first (and only) frame is the render broadcast.
+      const aFirst = await fa.next();
+      expect(aFirst.type).toBe('render');
+
+      // the sink disconnects → the surviving client (a) is promoted and now receives play.
+      b.close();
+      await once(b, 'close');
+      await new Promise((r) => setTimeout(r, 50)); // let the server's close handler promote the sink
+
+      handle.broadcastPlay(Int16Array.from([7, 7]), 24000);
+      const aPlay = await fa.next();
+      expect(aPlay.type).toBe('play');
+      expect(z.object({ pcm: z.array(z.number()) }).parse(aPlay).pcm).toEqual([7, 7]);
+    } finally {
+      a.close();
+      b.close();
+      await handle.close();
+    }
+  });
+
   it('a second subscribe to the same resource replaces the first → an append delivers ONCE', async () => {
     // Regression: each subscribe used to push a NEW subscriber, so a client that subscribed twice
     // (e.g. on reconnect) got every append fanned out N times. Now the per-resource subscription

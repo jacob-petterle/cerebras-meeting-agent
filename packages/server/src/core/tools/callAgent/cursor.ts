@@ -38,11 +38,13 @@ const DEFAULT_MODEL = 'composer-2.5';
 /** "Fast mode" is a model VARIANT param, not part of the id (catalog: `Composer 2.5{fast=true}`). */
 const FAST_MODE_PARAMS: ModelSelection['params'] = [{ id: 'fast', value: 'true' }];
 /**
- * Wall-clock budget for one sub-agent run. With ripgrep configured + fast mode a real codebase
- * investigation finishes in ~15s; 90s is a generous cap that still bounds a wedged run far tighter
- * than the old 180s. The heartbeat never blocks on this regardless (call_agent is fire-and-forget).
+ * Wall-clock budget for one sub-agent run. Default 10 minutes (Jacob's directive; overridable via
+ * main.ts's CURSOR_AGENT_TIMEOUT_MS). Even a trivial investigation measured ~60s with composer-2.5
+ * fast, so the old 90s cap killed legitimate multi-step work; a real codebase dig can take minutes.
+ * The heartbeat never blocks on this regardless (call_agent is fire-and-forget), and whatever the run
+ * settles to — findings or a timeout `error` — wakes the brain via the <sub_agents> resource.
  */
-const DEFAULT_TIMEOUT_MS = 90_000;
+const DEFAULT_TIMEOUT_MS = 600_000;
 /** How much of the agent's final summary text we keep for the deliverable `description` field. */
 const DESCRIPTION_MAX = 200;
 /**
@@ -128,24 +130,42 @@ function defaultAgentFactory(opts: CursorAgentFactoryOptions): Promise<CursorAge
 }
 
 /**
- * Build the prompt. We instruct the agent to investigate the task AND write a self-contained HTML
- * document to an EXACT absolute path we control (so we can read it deterministically afterwards), and
- * to put its final summary in the run result too (used for the deliverable description).
+ * Build the prompt. This wrapper carries ONLY the OUTPUT CONTRACT the server depends on: write the
+ * findings as a markdown document to an EXACT absolute path we control (so we can read it back
+ * deterministically) and put a one-paragraph summary in the run result (the deliverable description).
+ * It says NOTHING about HOW to investigate, how deep to dig, or how to ground the findings — that
+ * substance lives entirely in `task`, which the brain (Gemma) authors per call (see identity.ts "How to
+ * brief a sub-agent"). Keeping research craft out of here means ONE place owns it (the brain).
+ *
+ * Crucially, the findings are NOT shown to anyone — they are written FOR THE BRAIN (Gemma) TO READ.
+ * Gemma is the meeting's representative: it reads what its agents found and then decides, for the room,
+ * how (or whether) to communicate it — re-expressing it in its own words/visuals, never forwarding this
+ * file. So the document is optimized for the READER's comprehension, not for display: dense, structured
+ * markdown that may use code blocks, tables, and mermaid diagrams wherever they convey a finding more
+ * clearly than prose. There is NO slide budget and NO screenful limit — completeness and clarity win.
  */
 function buildPrompt(task: string, findingsPath: string): string {
   return [
-    'You are a research sub-agent embedded in a live meeting assistant. Investigate the task below',
-    'against the current working directory and produce a concise, well-organized findings document.',
-    'Use your file-search and read tools to ground the findings in the actual code/data.',
+    'You are a research sub-agent for a meeting assistant. Carry out the task below against the current',
+    'working directory. Your findings are READ BY THE ASSISTANT (not shown to anyone), so write them to',
+    'be understood by a reader — completely and clearly. This is NOT a slide; there is no length limit.',
     '',
-    `Write your findings as a SINGLE self-contained, valid, standalone HTML file to EXACTLY this path:`,
+    'Write your findings as a markdown document to EXACTLY this path:',
     `  ${findingsPath}`,
-    'Use proper HTML: a top-level <h1>, section <h2> headings, short paragraphs, and <ul>/<code> where',
-    'useful. Cite specifics (file paths, line numbers, concrete values) rather than vague summaries.',
-    'Do not include external scripts or network resources — the page must render offline in an iframe.',
     '',
-    'Also include a one-paragraph summary of your findings as your final assistant message, so it is',
+    'Make the markdown easy to absorb: clear structure, and wherever a visual communicates a finding',
+    'better than prose, use it — fenced code blocks for code/snippets, tables for comparisons, and',
+    'mermaid diagrams (```mermaid fences) for flows, architecture, or relationships. Use these where they',
+    'genuinely aid understanding, not for decoration.',
+    '',
+    'Be TERSE — dense and high-signal, no filler or padding — but do NOT sacrifice substance: cover',
+    'everything the task asked for, grounded in specifics (file paths, line numbers, concrete values).',
+    'Completeness and clarity matter more than brevity; just do not waste words.',
+    '',
+    'Also give a one-paragraph summary of your findings as your final assistant message, so it is',
     'captured in the run result.',
+    '',
+    'The task itself specifies WHAT to investigate, how deeply, and how to ground it — follow it as given.',
     '',
     'Task:',
     task,
@@ -224,11 +244,11 @@ function registerDeliverable(
   const now = Date.now();
   const record = DeliverableRecord.parse({
     id: args.id,
-    kind: 'html',
+    kind: 'markdown',
     title: 'Sub-agent findings',
     description: args.description,
     filePath: args.filePath,
-    mimeType: 'text/html',
+    mimeType: 'text/markdown',
     producedAt: now,
     registeredAt: now,
   });
@@ -323,7 +343,7 @@ export function createCallAgentCursor(deps: CallAgentCursorDeps): CallAgentFn {
     const id = randomUUID();
     const startedAt = Date.now();
     mkdirSync(outDir, { recursive: true });
-    const findingsPath = join(outDir, `FINDINGS-${id}.html`);
+    const findingsPath = join(outDir, `FINDINGS-${id}.md`);
 
     /** Status emitter; the deliverable reuses the SAME id so a `done` record's `deliverableId` matches. */
     const status = createStatusEmitter(deps.subAgents, { id, task: args.task, startedAt });

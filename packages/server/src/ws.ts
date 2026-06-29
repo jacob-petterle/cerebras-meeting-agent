@@ -107,6 +107,15 @@ function olderPage(
 export function createWsServer(deps: WsServerDeps): WsServerHandle {
   const wss = new WebSocketServer({ port: deps.port, host: deps.host ?? '127.0.0.1' });
   const clients = new Set<WebSocket>();
+  /**
+   * The single AUDIO SINK. TTS `play` frames go to exactly ONE client, never the whole set — otherwise
+   * every open client (a second tab, the operator console alongside the stage, a Shipyard webview next
+   * to a real browser) schedules the same utterance in its own AudioContext and you hear it doubled,
+   * slightly offset. Transcript/render/stats still broadcast to ALL clients (they're idempotent views);
+   * audio is the one output that must be single-sink. Latest connection wins (the tab you just opened to
+   * listen takes over); on its disconnect we promote the most-recently-connected survivor.
+   */
+  let audioSink: WebSocket | null = null;
 
   const whenReady = new Promise<number>((resolve, reject) => {
     wss.once('listening', () => {
@@ -119,6 +128,8 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
 
   wss.on('connection', (ws: WebSocket) => {
     clients.add(ws);
+    /** Newest client becomes the audio sink, so opening a fresh tab to listen takes over playback. */
+    audioSink = ws;
     /**
      * One live-append subscription PER resource for this socket. Re-subscribing to a resource
      * replaces the prior subscription (its unsub is called first), so a client that subscribes
@@ -184,6 +195,12 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
 
     ws.on('close', () => {
       clients.delete(ws);
+      /** If the sink dropped, promote the most-recently-connected survivor (insertion-ordered Set). */
+      if (audioSink === ws) {
+        let next: WebSocket | null = null;
+        for (const c of clients) next = c;
+        audioSink = next;
+      }
       for (const u of resourceUnsubs.values()) u();
       resourceUnsubs.clear();
     });
@@ -198,8 +215,9 @@ export function createWsServer(deps: WsServerDeps): WsServerHandle {
       for (const ws of clients) send(ws, { type: 'render', cmd });
     },
     broadcastPlay(pcm: Int16Array, sampleRate: number): void {
-      const arr = Array.from(pcm);
-      for (const ws of clients) send(ws, { type: 'play', sampleRate, pcm: arr });
+      /** Audio goes to the single sink only (see `audioSink`) — NOT fanned to every client. */
+      if (!audioSink) return;
+      send(audioSink, { type: 'play', sampleRate, pcm: Array.from(pcm) });
     },
     broadcastStats(stats): void {
       for (const ws of clients) {

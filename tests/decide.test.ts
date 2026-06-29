@@ -1,11 +1,16 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildResourceMessages,
   foldLatestById,
+  renderConversationResource,
   renderDeliverablesResource,
+  renderMeetingResource,
   renderResources,
+  renderScreenResource,
   renderSubAgentsResource,
-  renderTranscriptResource,
   toDecision,
 } from '../packages/server/src/core/decide';
 import type { AssembledToolCall } from '../packages/server/src/core/cerebras';
@@ -106,10 +111,10 @@ const dline = (over: Partial<DeliverableRecord>, seqNo = 0): LogEntry<Deliverabl
 });
 
 describe('resource rendering — conversation is a resource, not in-band', () => {
-  it('wraps each utterance in an XML <transcript> envelope, never a bare line', () => {
-    const out = renderTranscriptResource([tline({ text: "what's the weather" })], 0);
-    expect(out).toMatch(/^<transcript\b/);
-    expect(out).toContain('</transcript>');
+  it('wraps each utterance in an XML <conversation> envelope, never a bare line', () => {
+    const out = renderConversationResource([tline({ text: "what's the weather" })], 0);
+    expect(out).toMatch(/^<conversation\b/);
+    expect(out).toContain('</conversation>');
     expect(out).toContain('<utterance speaker="me" kind="human"');
     expect(out).toContain(">what's the weather</utterance>");
     // Framing that makes it observed-not-addressed.
@@ -120,7 +125,7 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
   });
 
   it('marks the agent\'s own prior turns kind="agent" so it recognizes itself', () => {
-    const out = renderTranscriptResource(
+    const out = renderConversationResource(
       [tline({ senderKind: 'agent', participantId: 'agent', text: 'four' })],
       0,
     );
@@ -129,7 +134,7 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
   });
 
   it('marks tool turns kind="tool"', () => {
-    const out = renderTranscriptResource(
+    const out = renderConversationResource(
       [tline({ senderKind: 'tool', participantId: 'call_agent', text: 'researched X' })],
       0,
     );
@@ -137,14 +142,14 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
   });
 
   it('escapes utterance text so it cannot break out of the envelope', () => {
-    const out = renderTranscriptResource([tline({ text: 'use <script> & "quotes"' })], 0);
+    const out = renderConversationResource([tline({ text: 'use <script> & "quotes"' })], 0);
     expect(out).toContain('use &lt;script&gt; &amp; &quot;quotes&quot;');
     expect(out).not.toContain('<script>');
   });
 
-  it('renders an empty transcript as a self-closing block (still a resource)', () => {
-    const out = renderTranscriptResource([], 0);
-    expect(out).toMatch(/^<transcript\b[^>]*\/>$/);
+  it('renders an empty conversation as a self-closing block (still a resource)', () => {
+    const out = renderConversationResource([], 0);
+    expect(out).toMatch(/^<conversation\b[^>]*\/>$/);
     expect(out).toContain('empty');
   });
 
@@ -155,7 +160,7 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
       tline({ text: 'old two', participantId: 'me' }, 1),
       tline({ text: 'fresh', participantId: 'me' }, 2),
     ];
-    const out = renderTranscriptResource(entries, 2);
+    const out = renderConversationResource(entries, 2);
     // The whole conversation is present (full memory), not just the delta.
     expect(out).toContain('>old one</utterance>');
     expect(out).toContain('>old two</utterance>');
@@ -175,7 +180,7 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
     const entries = Array.from({ length: 150 }, (_v, i) =>
       tline({ text: `line ${i}`, participantId: 'me' }, i),
     );
-    const out = renderTranscriptResource(entries, 150);
+    const out = renderConversationResource(entries, 150);
     // Oldest are elided; the newest are kept.
     expect(out).not.toContain('>line 0</utterance>');
     expect(out).toContain('>line 149</utterance>');
@@ -183,11 +188,33 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
     expect(out).toContain('showing-last="100"');
   });
 
-  it('renders deliverables as XML with id + kind + title (for share_screen)', () => {
-    const out = renderDeliverablesResource([dline({ id: 'dX', kind: 'html', title: 'Incident report' })]);
+  it('renders deliverables as XML with id + kind + title — findings for the brain to READ, not a display-by-id path', () => {
+    const out = renderDeliverablesResource([dline({ id: 'dX', kind: 'markdown', title: 'Incident report' })]);
     expect(out).toMatch(/^<deliverables\b/);
-    expect(out).toContain('<deliverable id="dX" kind="html" title="Incident report"');
-    expect(out).toContain('deliverableId');
+    expect(out).toContain('<deliverable id="dX" kind="markdown" title="Incident report"');
+    // No file on disk → self-closing element (no inlined content to read).
+    expect(out).toContain('/>');
+    // The old "share_screen by deliverableId" DISPLAY path is gone — these are written FOR the brain to READ.
+    expect(out).not.toContain('deliverableId');
+    expect(out).toContain('FOR YOU TO READ');
+  });
+
+  it('inlines the findings file content (xml-escaped) so the brain can actually read it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deliv-'));
+    try {
+      const fp = join(dir, 'FINDINGS.md');
+      writeFileSync(fp, '# Race in <foo> & bar\n\n17 files import it', 'utf-8');
+      const out = renderDeliverablesResource([
+        dline({ id: 'dC', kind: 'markdown', title: 'Race', filePath: fp }),
+      ]);
+      // A file on disk → the element OPENS (not self-closed) and inlines the content, xml-escaped.
+      expect(out).toContain('<deliverable id="dC"');
+      expect(out).toContain('</deliverable>');
+      expect(out).toContain('Race in &lt;foo&gt; &amp; bar');
+      expect(out).toContain('17 files import it');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('renders an empty deliverables list as a self-closing block', () => {
@@ -195,17 +222,24 @@ describe('resource rendering — conversation is a resource, not in-band', () =>
     expect(out).toMatch(/^<deliverables\b[^>]*\/>$/);
   });
 
-  it('renderResources carries current-time + transcript + sub_agents + deliverables', () => {
+  it('renderResources carries the <meeting> envelope (conversation + screen) + sub_agents + deliverables', () => {
     const out = renderResources({
       transcript: [tline({ text: 'hi' })],
       newSinceSeqNo: 0,
       deliverables: [dline({})],
       subAgents: [],
+      screen: { label: 'Chart', kind: 'html', since: 0, mine: true },
     });
-    expect(out).toContain('<current-time iso=');
-    expect(out).toContain('<transcript');
+    // The meeting envelope wraps what's SAID + SHOWN; the agent's workshop stays outside it.
+    expect(out).toContain('<meeting now=');
+    expect(out).toContain('<conversation');
+    expect(out).toContain('<screen');
+    expect(out).toContain('</meeting>');
     expect(out).toContain('<sub_agents');
     expect(out).toContain('<deliverables');
+    // The old flat current-time/transcript tags are gone.
+    expect(out).not.toContain('<current-time');
+    expect(out).not.toContain('<transcript');
   });
 });
 
@@ -317,7 +351,7 @@ describe('buildResourceMessages — nothing in band', () => {
     expect(systemTurns.some((m) => String(m.content).includes('deploy on friday'))).toBe(true);
     // …and in NO user message (the crux of "nothing in band").
     expect(userTurns.every((m) => !String(m.content).includes('deploy on friday'))).toBe(true);
-    expect(userTurns.every((m) => !String(m.content).includes('<transcript'))).toBe(true);
+    expect(userTurns.every((m) => !String(m.content).includes('<meeting'))).toBe(true);
   });
 
   it('the only user turn is the content-free heartbeat pulse', () => {
@@ -331,8 +365,74 @@ describe('buildResourceMessages — nothing in band', () => {
   it('keeps the static identity and the dynamic resources as separate system messages', () => {
     expect(msgs[0]).toMatchObject({ role: 'system', content: 'IDENTITY+CONVENTION' });
     expect(msgs[1]!.role).toBe('system');
-    expect(String(msgs[1]!.content)).toContain('<transcript');
+    expect(String(msgs[1]!.content)).toContain('<meeting');
+    expect(String(msgs[1]!.content)).toContain('<conversation');
     expect(String(msgs[1]!.content)).toContain('<sub_agents');
     expect(String(msgs[1]!.content)).toContain('<deliverables');
+  });
+});
+
+/**
+ * Temporal sense (#34/#36) + the sleep tool (#35). Time reaches the brain as human RELATIVE AGES (not
+ * epoch ms); the screen is observable session state with a `mine` honesty bit; sleep is a yield-with-
+ * duration that passes the toDecision funnel like any tool.
+ */
+describe('temporal sense — ages, <screen>, <meeting>, sleep', () => {
+  it('renders utterance ages relative to now, never raw epoch ms', () => {
+    const now = 1_000_000;
+    const out = renderConversationResource([tline({ text: 'hi', timestamp: now - 40_000 })], 0, now);
+    expect(out).toContain('age="40s"');
+    expect(out).not.toContain('ts=');
+  });
+
+  it('floors sub-2s gaps to "just now"', () => {
+    const now = 1_000_000;
+    const out = renderConversationResource([tline({ timestamp: now - 800 })], 0, now);
+    expect(out).toContain('age="just now"');
+  });
+
+  it('renders OUR share as mine="true" with an up-for age', () => {
+    const now = 1_000_000;
+    const out = renderScreenResource({ label: 'ERD', kind: 'html', since: now - 40_000, mine: true }, now);
+    expect(out).toMatch(/^<screen\b/);
+    expect(out).toContain('showing="ERD"');
+    expect(out).toContain('mine="true"');
+    expect(out).toContain('up-for="40s"');
+  });
+
+  it('renders an external presenter as mine="false" (multi-share honesty)', () => {
+    const out = renderScreenResource({ label: 'Dylan is sharing', kind: '', since: 0, mine: false }, 5_000);
+    expect(out).toContain('mine="false"');
+    expect(out).toContain('Dylan is sharing');
+  });
+
+  it('renders an empty screen as a self-closing block', () => {
+    expect(renderScreenResource(null, 1_000)).toMatch(/^<screen\b[^>]*\/>$/);
+  });
+
+  it('wraps conversation + screen in <meeting> with now/elapsed/room-quiet-for', () => {
+    const now = 1_000_000;
+    const out = renderMeetingResource({
+      transcript: [tline({ text: 'hello', timestamp: now - 60_000 })],
+      newSinceSeqNo: 0,
+      screen: { label: 'Chart', kind: 'html', since: now - 10_000, mine: true },
+      now,
+    });
+    expect(out).toMatch(/^<meeting\b/);
+    expect(out).toContain('now="');
+    expect(out).toContain('room-quiet-for="1m"');
+    expect(out).toContain('<conversation');
+    expect(out).toContain('<screen');
+    expect(out).toContain('</meeting>');
+  });
+
+  it('a valid sleep call passes the funnel with its seconds', () => {
+    const d = toDecision(call({ name: 'sleep', arguments: '{"seconds":30}' }));
+    expect(d).toEqual({ name: 'sleep', args: { seconds: 30 } });
+  });
+
+  it('a sleep with no seconds fails the schema → no_op', () => {
+    const d = toDecision(call({ name: 'sleep', arguments: '{}' }));
+    expect(d).toEqual({ name: 'no_op', args: {} });
   });
 });

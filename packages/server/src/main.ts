@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { createResources } from './core/resources';
+import { createScreenState } from './core/screen-state';
 import { createCerebrasClient } from './core/cerebras';
 import { createDecide, foldLatestById, type Decision } from './core/decide';
 import { createOrchestrator, intervalScheduler, type Orchestrator } from './core/orchestrator';
@@ -57,12 +58,19 @@ const EXCLUDE_NODE_ID = process.env.EXCLUDE_NODE_ID || undefined;
 /** Verbose per-frame pipeline logging (high-frequency). Off by default; `DEBUG_PIPE=1` to enable. */
 const DEBUG_PIPE = process.env.DEBUG_PIPE === '1';
 /**
- * Heartbeat FALLBACK interval (ms). The brain now also reacts event-driven — a new utterance pokes it
- * to decide within ~a debounce — so this is just the idle cadence that catches non-speech events (e.g.
- * a finished sub-agent's deliverable to share). Lower than the old 4000 for snappier idle pickup.
- * Override with HEARTBEAT_MS (e.g. =1000 to experiment).
+ * Heartbeat FALLBACK interval (ms) — NOT the primary driver. The brain is VAD-driven: a new utterance
+ * pokes it to decide ~500ms after the speaker pauses. This slow timer is only a safety net: it catches
+ * a delta that landed while the brain was mid-decision (the poke is a no-op while busy) and non-speech
+ * events (e.g. a finished sub-agent's deliverable to share). Override with HEARTBEAT_MS.
  */
-const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 1000);
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 4000);
+/**
+ * Wall-clock budget for ONE research sub-agent run (ms). Default 10 minutes (Jacob's directive): a real
+ * codebase investigation can take minutes, and a trivial task already measured ~60s, so the old 90s cap
+ * killed legitimate work. The heartbeat never blocks on this regardless (call_agent is fire-and-forget),
+ * and whatever the run settles to — findings or a timeout — wakes the brain via the <sub_agents> resource.
+ */
+const CURSOR_AGENT_TIMEOUT_MS = Number(process.env.CURSOR_AGENT_TIMEOUT_MS ?? 600_000);
 /** Repo root (…/cerebras-hackathon-prep), three up from packages/server/src/main.ts. */
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 
@@ -127,6 +135,10 @@ function summarizeDecision(d: Decision): string {
       return argField(d.args, 'title') || argField(d.args, 'kind') || 'artifact';
     case 'call_agent':
       return argField(d.args, 'task');
+    case 'sleep': {
+      const secs = isRecord(d.args) && typeof d.args.seconds === 'number' ? d.args.seconds : null;
+      return secs != null ? `standing down ~${secs}s` : 'standing down';
+    }
     default:
       return '';
   }
@@ -154,6 +166,12 @@ async function main(): Promise<void> {
 
   // Resource spine (transcript + deliverables append-logs).
   const resources = createResources();
+  /**
+   * Shared-screen state — what artifact is currently on the stage and since when. Updated whenever WE
+   * render (the Display port is wrapped below), read each beat by the brain as the <screen> resource so
+   * it can reason about "how long to keep the diagram up". Cleared on session reset.
+   */
+  const screen = createScreenState();
 
   // Media leg — on-device only (Moonshine / kokoro / Silero). No hosted providers, no fallbacks.
   const vad = createVad({});
@@ -176,6 +194,7 @@ async function main(): Promise<void> {
     resources.transcript.reset();
     resources.deliverables.reset();
     resources.subAgents.reset();
+    screen.clear();
     orchestratorRef?.reset();
   };
 
@@ -204,6 +223,19 @@ async function main(): Promise<void> {
     display = createDisplayWs(ws);
   }
 
+  /**
+   * Wrap the Display port so every artifact WE put on screen is recorded as the current shared-screen
+   * state (the <screen> resource the brain reads). The local browser and the Zoom bot both render through
+   * this identical path, so this captures all of our shares with no adapter-specific code.
+   */
+  const baseRender = display.render.bind(display);
+  display = {
+    render: async (cmd) => {
+      screen.noteOurShare(cmd, Date.now());
+      await baseRender(cmd);
+    },
+  };
+
   const ports: Ports = { audioIn, audioOut, display };
 
   // AudioIn → VAD → STT → transcript (raw STT, straight in — no corrector). The per-utterance
@@ -222,7 +254,12 @@ async function main(): Promise<void> {
    * fixed fallback interval. `poke()` is a no-op while a beat is already in flight.
    */
   let pokeTimer: ReturnType<typeof setTimeout> | null = null;
-  const POKE_DEBOUNCE_MS = 350;
+  /**
+   * The brain is VAD-driven: it decides ~this long after a speaker pauses, NOT on a fixed timer. The
+   * window is a debounce — back-to-back / overlapping utterances (incl. different speakers) reset it,
+   * so a whole multi-utterance turn collapses into ONE decision instead of one-per-utterance.
+   */
+  const POKE_DEBOUNCE_MS = 500;
   const pokeSoon = (): void => {
     if (pokeTimer) clearTimeout(pokeTimer);
     pokeTimer = setTimeout(() => {
@@ -285,6 +322,12 @@ async function main(): Promise<void> {
       subAgents: resources.subAgents,
       /** The transcript resource — the model observes the FULL conversation each beat (new marked). */
       transcript: resources.transcript,
+      /**
+       * The shared-screen state — read each beat as the <screen> block inside <meeting>, so the model
+       * knows what's currently on screen and for how long. Fed by the wrapped Display port (every
+       * share_screen records here) — the SAME path the local web app and the Zoom bot both render through.
+       */
+      screen: () => screen.current(),
       /** Live tok/s + token counts → the web HUD (otherwise computed in cerebras.ts and discarded). */
       onStats: (stats) => ws.broadcastStats(stats),
     });
@@ -302,6 +345,8 @@ async function main(): Promise<void> {
           outDir: join(REPO_ROOT, '.deliverables'),
           apiKey: cursorKey,
           cwd: CURSOR_AGENT_CWD,
+          /** 10-minute wall-clock budget per run (CURSOR_AGENT_TIMEOUT_MS); the heartbeat never blocks on it. */
+          timeoutMs: CURSOR_AGENT_TIMEOUT_MS,
           /** Optional model override; defaults to composer-2.5 (fast mode) in cursor.ts. */
           model: process.env.CURSOR_AGENT_MODEL || undefined,
           onProgress: (l) => console.log(l),
@@ -320,16 +365,42 @@ async function main(): Promise<void> {
       /** Resolve share_screen{deliverableId} to the real findings file so the stage shows it (Task C). */
       deliverables: resources.deliverables,
     });
+    /**
+     * Write a completed tool's outcome back to the transcript so (a) the model sees its own prior turns
+     * next heartbeat (memory) and (b) the web console's Tools/Agent tabs + HUD light up. `participantId`
+     * is 'agent' for spoken turns, else the tool name. The orchestrator advances its cursor to the
+     * claimed head only, so these self-authored lines don't cause a runaway (the no_op bias holds for them).
+     */
+    const writeBack = (outcome: { senderKind: 'agent' | 'tool'; text: string }, name: string): void => {
+      resources.transcript.append({
+        participantId: outcome.senderKind === 'agent' ? 'agent' : name,
+        senderKind: outcome.senderKind,
+        text: outcome.text,
+        timestamp: Date.now(),
+      });
+      /**
+       * The agent's OWN line just landed. Nudge the heartbeat so it continues the turn promptly — but
+       * now WITH memory: the next beat sees this kind="agent"/"tool" line, which the prompt treats as
+       * "you already did this, don't repeat yourself". That memory is what keeps the brain from echoing
+       * itself (vs. an eager empty-delta beat, which has no such memory). The brain reads its own line
+       * and almost always no_ops to yield; the MAX_TURN_ACTIONS cap is the hard backstop if it doesn't.
+       */
+      orchestratorRef?.poke();
+    };
+    /**
+     * Serial chain for `speak`. Every tool is fire-and-forget (the orchestrator never awaits dispatch),
+     * so two quick speaks would otherwise run TTS concurrently and could play out of order. We queue
+     * speaks onto one promise chain — the heartbeat stays non-blocking, but audio plays in dispatch
+     * order. `.catch` keeps one failed speak from poisoning the chain. (call_agent / share_screen run
+     * independently — a long research must NOT sit behind, or hold up, the speak queue.)
+     */
+    let speakChain: Promise<void> = Promise.resolve();
     const orchestrator = createOrchestrator({
       transcript: resources.transcript,
       decide,
       /**
-       * Dispatch wrapper: run the tool, then write the outcome back to the transcript so (a) the
-       * model sees its own prior turns next heartbeat (memory) and (b) the web console's Tools/Agent
-       * tabs + HUD light up. `no_op` returns null → nothing appended. The participantId is 'agent'
-       * for spoken turns, else the tool name. The orchestrator already advances its cursor to the
-       * claimed head only, so these self-authored entries don't cause a runaway self-trigger (and
-       * the model's strong no_op bias holds for agent-authored lines).
+       * Dispatch wrapper. The orchestrator calls this DETACHED (fire-and-forget) for every action, so
+       * nothing here blocks the heartbeat — it just runs the tool and writes the outcome back when done.
        */
       dispatch: async (decision) => {
         /**
@@ -351,15 +422,24 @@ async function main(): Promise<void> {
             return;
           }
         }
+        if (decision.name === 'speak') {
+          speakChain = speakChain
+            .then(() => registry.dispatch(decision))
+            .then((outcome) => {
+              if (outcome) writeBack(outcome, decision.name);
+            })
+            .catch((err: unknown) => console.error('[main] speak dispatch failed:', err));
+          return speakChain;
+        }
         const outcome = await registry.dispatch(decision);
         if (!outcome) return;
-        resources.transcript.append({
-          participantId: outcome.senderKind === 'agent' ? 'agent' : decision.name,
-          senderKind: outcome.senderKind,
-          text: outcome.text,
-          timestamp: Date.now(),
-        });
+        writeBack(outcome, decision.name);
       },
+      /**
+       * The live sub-agent log — the orchestrator subscribes to it and WAKES the brain when a research
+       * settles (done/error), so a finished result or a TIMEOUT gets a reaction instead of silence.
+       */
+      subAgents: resources.subAgents,
       /** Surface EVERY decision (incl. no_op) to the console's decision feed — UI-only, not the transcript. */
       onDecision: (decision) =>
         ws.broadcastDecision({ name: decision.name, detail: summarizeDecision(decision), ts: Date.now() }),
