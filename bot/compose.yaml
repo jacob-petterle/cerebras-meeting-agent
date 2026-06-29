@@ -8,9 +8,13 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      # Stage page the headed Chromium loads (the Mac-served web stage). Default
-      # points at the team's `packages/web` Vite dev server on the host.
-      - STAGE_URL=${STAGE_URL:-http://host.docker.internal:5173}
+      # Debug the agent live INSIDE the Zoom screen-share: DEBUG_UI=1 makes the bot load the FULL
+      # operator console (?view=full) instead of the deliverable-only stage. Default 0 = clean
+      # deliverable. Usage: `DEBUG_UI=1 docker compose up`.
+      - DEBUG_UI=${DEBUG_UI:-0}
+      # Explicit FULL override of the page Chromium loads (host + view). When unset, entry.sh builds
+      # it from DEBUG_UI against the team's `packages/web` Vite dev server on the host.
+      - STAGE_URL=${STAGE_URL:-}
       # Screen-share frame source: stage (capture Chromium on Xvfb) | text
       # (render out/share_text.txt). entry.sh skips launching Chromium for text.
       - SHARE_MODE=${SHARE_MODE:-stage}
