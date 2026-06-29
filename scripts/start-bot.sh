@@ -38,8 +38,11 @@ echo "▶ stopping any previous bot + clearing stale capture"
 ( cd "$BOT" && docker compose down >/dev/null 2>&1 ) || true
 rm -f "$BOT"/out/node-*.pcm "$BOT"/out/share_text.txt "$BOT"/out/meeting-audio.pcm "$BOT"/out/*.log 2>/dev/null || true
 
-echo "▶ web stage (:5173)"
-lsof -ti tcp:5173 >/dev/null 2>&1 && echo "   already up" || ( cd "$REPO" && nohup pnpm web >/tmp/zoom-web.log 2>&1 & )
+echo "▶ web stage (:5173, debug UI for the operator)"
+# Run the dev server with VITE_DEBUG_UI=1 so YOUR browser at http://localhost:5173/ shows the full
+# operator console (transcript/HUD/tabs). The bot loads ?view=stage, which forces deliverable-only
+# regardless of this flag — so the screenshare stays clean while you still get the console to watch.
+lsof -ti tcp:5173 >/dev/null 2>&1 && echo "   already up" || ( cd "$REPO" && nohup pnpm web:debug >/tmp/zoom-web.log 2>&1 & )
 
 echo "▶ brain + zoom adapters (:8787)"
 lsof -ti tcp:8787 2>/dev/null | xargs kill -9 2>/dev/null || true
@@ -57,8 +60,8 @@ grep -E "ZOOM mode|brain enabled" /tmp/zoom-server.log 2>/dev/null | tail -2 || 
 cat <<'NEXT'
 
 ── after the bot joins, do these in Zoom (host-UI only) ───────────────────
-   1. admit "Triage Bot" from the waiting room (or disable Waiting Room to skip)
-   2. grant it RECORDING permission (Participants → Triage Bot → ⋯ → Allow Record)
+   1. admit "Atlas" from the waiting room (or disable Waiting Room to skip)
+   2. grant it RECORDING permission (Participants → Atlas → ⋯ → Allow Record)
    3. allow screen share — then talk.   logs: tail -f /tmp/zoom-server.log
    blank share?  Ctrl-C, then:  cd bot && SHARE_MODE=text docker compose up
 ───────────────────────────────────────────────────────────────────────────

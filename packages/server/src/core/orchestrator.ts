@@ -3,13 +3,11 @@ import type { AppendLog } from './resources';
 import type { Decision } from './decide';
 
 /**
- * The 4s heartbeat loop — the agent's clock.
+ * The heartbeat loop — the agent's clock.
  *
  * Injectable scheduler (never a real timer in tests). Each tick:
- *   0. correct: drain freshly-buffered raw STT and append the CORRECTED lines to the transcript (a
- *      separate Gemma call, injected as `correct`). Runs FIRST, under the busy lock, so the brain
- *      only ever decides on corrected text — raw STT never reaches the transcript.
- *   1. read the delta `transcript.since(cursor)`; empty → return (no decide).
+ *   1. read the delta `transcript.since(cursor)`; empty → return (no decide). Raw STT was appended to
+ *      the transcript at capture time — there is NO corrector / second LLM pass anymore.
  *   2. claim the span: remember `claimedHead = delta.at(-1).seqNo` BEFORE deciding.
  *   3. decide on the delta. `no_op` → advance cursor to claimedHead, dispatch nothing.
  *   4. for a FAST action (speak/share_screen): dispatch DETACHED and hold the busy lock so the next
@@ -19,9 +17,9 @@ import type { Decision } from './decide';
  *   5. for `call_agent` (the SLOW research sub-agent, tens of seconds to minutes): FIRE-AND-FORGET.
  *      Dispatch detached, but advance the cursor AND release the busy lock IMMEDIATELY — do NOT hold
  *      the lock for the whole run. This is the non-blocking fix: the heartbeat keeps ticking while the
- *      sub-agent works, so the brain keeps correcting/observing/speaking and never freezes. Re-firing
- *      the SAME research is prevented NOT by the busy lock here but by the live <sub_agents> resource
- *      (the model sees status=running) plus a hard re-fire guard in the dispatch wrapper.
+ *      sub-agent works, so the brain keeps observing/speaking and never freezes. Re-firing the SAME
+ *      research is prevented NOT by the busy lock here but by the live <sub_agents> resource (the model
+ *      sees status=running) plus a hard re-fire guard in the dispatch wrapper.
  */
 
 /** The injectable clock. `every` registers a periodic callback and returns an unsubscribe. */
@@ -53,14 +51,6 @@ export interface OrchestratorDeps {
   dispatch: (decision: Decision) => Promise<void>;
   scheduler: Scheduler;
   /**
-   * Step ONE of each heartbeat, run BEFORE the transcript delta is read: drain freshly-buffered raw
-   * STT segments, correct them (a separate Gemma call), and append the CORRECTED lines to the
-   * transcript. This ordering is the gate — the brain only ever decides on corrected text. Awaited
-   * under the busy lock (no overlapping corrections) and bounded by its own internal timeout. It owns
-   * its errors; the tick guards anyway. Optional: tests and the no-key path omit it.
-   */
-  correct?: () => Promise<void>;
-  /**
    * Observe EVERY decision the brain makes, including `no_op` (which dispatches nothing). UI-only —
    * the wiring broadcasts it to the console so a heartbeat that chose silence is still visible.
    */
@@ -90,7 +80,7 @@ export interface Orchestrator {
 const HEARTBEAT_MS = 4000;
 
 export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
-  const { transcript, decide, dispatch, scheduler, correct } = deps;
+  const { transcript, decide, dispatch, scheduler } = deps;
   const intervalMs = deps.intervalMs ?? HEARTBEAT_MS;
 
   let cursor = -1;
@@ -100,35 +90,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   let generation = 0;
 
   async function tick(): Promise<void> {
-    /** Busy lock: a correction or an action is in-flight — do not start another tick. */
+    /** Busy lock: an action is in-flight — do not start another tick. */
     if (busy) return;
     busy = true;
 
     /**
-     * Snapshot the generation up front: a reset() during the correction OR a later await must NOT let
-     * this tick write the cursor or decide on a wiped span.
+     * Snapshot the generation up front: a reset() during a later await must NOT let this tick write the
+     * cursor or decide on a wiped span.
      */
     const gen = generation;
-
-    /**
-     * Step ONE — correction. Drain buffered raw STT, correct it, and append the CORRECTED lines to the
-     * transcript so the delta read below already reflects them. `correct` owns its own errors and
-     * timeout; we still guard so a throw can't wedge the loop (busy stuck true).
-     */
-    try {
-      await correct?.();
-    } catch (err) {
-      console.error('[orchestrator] correct failed:', err);
-    }
-
-    /**
-     * A reset() landed during correction: the transcript was wiped and the cursor rewound. Abort this
-     * beat rather than decide on a span that no longer exists (mirrors the gen-guard on cursor writes).
-     */
-    if (gen !== generation) {
-      busy = false;
-      return;
-    }
 
     const delta = transcript.since(cursor);
     if (delta.length === 0) {
