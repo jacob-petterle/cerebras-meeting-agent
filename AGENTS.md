@@ -1,8 +1,8 @@
 # AGENTS.md — source of truth for implementers
 
 > **If you are a sub-agent or a future session: read THIS file + the implementation plan
-> (`~/.claude/plans/staged-splashing-axolotl.md`) first.** On any conflict with the older research
-> docs (ARCHITECTURE.md, RISK-AUDIT.md), this file + the plan win. See "Doc status" at the bottom.
+> (`~/.claude/plans/staged-splashing-axolotl.md`) first.** On any conflict with older research
+> notes, this file + the plan win. See "Doc status" at the bottom.
 
 ## What we're building (current phase)
 
@@ -20,7 +20,7 @@ for LOCAL use only — no Zoom.** Zoom is a later adapter swap.
 ## Stack (decided, source-verified)
 
 - **LLM** — `openai` npm → baseURL `https://api.cerebras.ai/v1`, model `gemma-4-31b`. **Accumulate streamed `tool_calls` by `index`** (Cerebras quirk).
-- **Sub-agent** — `@cursor/sdk` (native TS). Mocked first (fixed FINDINGS.html), real later. Brief: CURSOR-SDK-BRIEF.md.
+- **Sub-agent** — `@cursor/sdk` (native TS). Mocked first (fixed FINDINGS.html), real later.
 - **STT** — Moonshine (`onnx-community/moonshine-base-ONNX`) via `@huggingface/transformers` 3.8.1, **`device:'cpu'`** (verified running locally, on-device). NOTE: transformers.js 3.8.1 has **no `'coreml'` device string** — ANE/CoreML would need an onnxruntime-node execution-provider config, a later optimization. **No hosted fallback.**
 - **TTS** — `kokoro-js` (on-device, ~sub-1s/sentence). **No hosted fallback.**
 - **VAD** — `@ricky0123/vad-node` (pin `onnxruntime-node`).
@@ -48,8 +48,8 @@ transcript needs). **Decision: Option A** (our own WS subscribe/render). Copy:
 ## What NOT to build (for the local harness)
 
 - **No Zoom** — later adapter (ZOOM-SETUP.md is Dylan's Phase-2 track).
-- **No Cloudflare** — CLOUDFLARE-LAUNCH.md is post-local deployment, not now.
-- **No Shipyard daemon / local-direct WS client** — ARCHITECTURE.md Thread 2 is superseded; we use the Cursor SDK.
+- **No Cloudflare** — post-local deployment, not now.
+- **No Shipyard daemon / local-direct WS client** — that approach is superseded; we use the Cursor SDK.
 - **No Pipecat** — voice is local Moonshine/kokoro.
 - **No Loro/CRDT** — resources are a seqNo append-log.
 
@@ -79,8 +79,6 @@ transcript needs). **Decision: Option A** (our own WS subscribe/render). Copy:
 ## Doc status
 
 - **AGENTS.md** (this) + **the plan** — SOURCE OF TRUTH.
-- **CURSOR-SDK-BRIEF.md** — CURRENT (the chosen sub-agent engine).
-- **CLOUDFLARE-LAUNCH.md** — CURRENT, post-local deployment plan (not needed for the local build).
+- **README.md** — project overview (architecture diagrams, quick start).
 - **ZOOM-SETUP.md** — CURRENT, Phase-2 Zoom track (Dylan; not in the local build).
-- **RISK-AUDIT.md** — HISTORICAL, mostly valid (risk register R1–R6, Zoom de-risk). Note: Pipecat→Moonshine/kokoro; Appendix B → CLOUDFLARE-LAUNCH.md.
-- **ARCHITECTURE.md** — PARTIALLY SUPERSEDED. Ports/adapters + presentation-pipeline reasoning still holds; the Shipyard-daemon integration, Pipecat, and model-attribution A/B are obsolete.
+- **bot/README.md** — the Zoom bot's own build & run guide.

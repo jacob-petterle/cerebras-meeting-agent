@@ -28,7 +28,7 @@ All audio at the boundary is **32 kHz mono signed-16-bit little-endian PCM**.
   barge-in; suppress STT of the bot's own voice (self-echo guard).
 - **Show** — write what to display to the **share channel** `out/share_text.txt`; the bot renders
   it as an OpenCV overlay on its screen-share, updated live. (Text today; image/URL via a Chromium
-  stage page is the documented next step — see `ARCHITECTURE.md` "Presentation pipeline".)
+  stage page is the documented next step — see `AGENTS.md`.)
 
 ## Run
 
