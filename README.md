@@ -148,7 +148,5 @@ pnpm web:debug   # stage + full operator console (VITE_DEBUG_UI=1)
 ## Further reading
 
 - **[AGENTS.md](./AGENTS.md)** — the source of truth for implementers (architecture, stack decisions, gotchas).
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the original deep-research architecture brief *(partially superseded; see header)*.
 - **[ZOOM-SETUP.md](./ZOOM-SETUP.md)** — Zoom Meeting SDK setup track.
-- **[RISK-AUDIT.md](./RISK-AUDIT.md)** — Zoom / Cerebras / voice risk notes.
 - **[bot/README.md](./bot/README.md)** — the Zoom bot's own build & run guide.
